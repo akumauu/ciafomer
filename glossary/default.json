@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "source": "hello",
+      "target": "你好"
+    },
+    {
+      "source": "world",
+      "target": "世界"
+    }
+  ]
+}

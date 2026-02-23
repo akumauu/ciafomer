@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Mode Panel</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body class="mode-panel-body">
+  <div id="mode-panel">
+    <div class="mode-title">Select Mode</div>
+    <button class="mode-btn" data-mode="selection">
+      <span class="mode-icon">T</span>
+      <span class="mode-label">Selection</span>
+    </button>
+    <button class="mode-btn" data-mode="ocr_region">
+      <span class="mode-icon">R</span>
+      <span class="mode-label">OCR Region</span>
+    </button>
+    <button class="mode-btn" data-mode="realtime">
+      <span class="mode-icon">S</span>
+      <span class="mode-label">Realtime</span>
+    </button>
+    <button class="mode-btn cancel-btn" id="btn-dismiss">
+      <span class="mode-label">Cancel</span>
+    </button>
+  </div>
+  <script src="mode-panel.js"></script>
+</body>
+</html>

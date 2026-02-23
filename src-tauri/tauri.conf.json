@@ -1,0 +1,50 @@
+{
+  "productName": "ciallo",
+  "version": "0.1.0",
+  "identifier": "com.ciallo.translator",
+  "build": {
+    "frontendDist": "../dist",
+    "beforeDevCommand": "npm run build",
+    "beforeBuildCommand": "npm run build"
+  },
+  "bundle": {
+    "active": true,
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico",
+      "icons/icon.png"
+    ]
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Ciallo Translator",
+        "visible": false,
+        "width": 420,
+        "height": 320,
+        "resizable": false,
+        "center": true
+      },
+      {
+        "label": "mode-panel",
+        "title": "",
+        "visible": false,
+        "width": 280,
+        "height": 180,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "center": true,
+        "resizable": false,
+        "url": "mode-panel.html"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'"
+    }
+  }
+}
