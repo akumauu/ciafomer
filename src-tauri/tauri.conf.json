@@ -41,6 +41,19 @@
         "center": true,
         "resizable": false,
         "url": "mode-panel.html"
+      },
+      {
+        "label": "result-panel",
+        "title": "",
+        "visible": false,
+        "width": 480,
+        "height": 320,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "center": true,
+        "resizable": true,
+        "url": "result-panel.html"
       }
     ],
     "security": {

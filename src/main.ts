@@ -119,6 +119,33 @@ async function init(): Promise<void> {
     showFeedback('Cancelled.');
   });
 
+  // Phase 2: translation pipeline events
+  await listen('capture-complete', () => {
+    setStatus('Translate');
+    showFeedback('Text captured, translating...');
+  });
+
+  await listen('capture-error', (event: { payload: unknown }) => {
+    const data = event.payload as { error: string };
+    setStatus('Sleep');
+    showFeedback('Capture failed: ' + data.error);
+  });
+
+  await listen('translate-chunk', () => {
+    setStatus('Render');
+  });
+
+  await listen('translate-complete', () => {
+    setStatus('Idle');
+    showFeedback('Translation complete.');
+  });
+
+  await listen('translate-error', (event: { payload: unknown }) => {
+    const data = event.payload as { error: string };
+    setStatus('Sleep');
+    showFeedback('Translation failed: ' + data.error);
+  });
+
   // Initial state
   const state = await invoke('get_state') as string;
   setStatus(state as AppState);

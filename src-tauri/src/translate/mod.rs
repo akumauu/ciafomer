@@ -1,7 +1,21 @@
-//! Translation module (Phase 1 stub with full interface).
-//! Real implementation in Phase 2: DeepSeek API via reqwest, caching, retry, etc.
+//! Translation module — orchestrates normalization, glossary, cache, and API client.
+//! Phase 2: full selection-mode translation pipeline.
+
+pub mod normalize;
+pub mod glossary;
+pub mod cache;
+pub mod deepseek;
+
+use std::sync::Arc;
 
 use serde::{Serialize, Deserialize};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info};
+
+use cache::TranslationCache;
+use deepseek::DeepSeekClient;
+use glossary::Glossary;
+use normalize::PlaceholderProtector;
 
 /// Translation request.
 #[derive(Debug, Clone, Serialize)]
@@ -32,11 +46,6 @@ pub struct TranslateResult {
     pub elapsed_ms: f64,
 }
 
-/// Translator trait (adapter for different backends).
-pub trait Translator: Send + Sync {
-    fn translate(&self, request: TranslateRequest) -> Result<TranslateResult, TranslateError>;
-}
-
 #[derive(Debug)]
 pub enum TranslateError {
     ApiError(String),
@@ -60,18 +69,101 @@ impl std::fmt::Display for TranslateError {
     }
 }
 
-/// Stub translator for Phase 1.
-pub struct StubTranslator;
+/// Orchestrates the full translation pipeline:
+/// normalize → glossary match → cache check → API call → restore placeholders → cache insert.
+pub struct TranslationService {
+    pub client: DeepSeekClient,
+    pub cache: Arc<TranslationCache>,
+    pub glossary: Arc<Glossary>,
+    protector: PlaceholderProtector,
+}
 
-impl Translator for StubTranslator {
-    fn translate(&self, req: TranslateRequest) -> Result<TranslateResult, TranslateError> {
-        Ok(TranslateResult {
-            request_id: req.request_id,
-            translated_text: format!("[stub] {}", req.source_text),
-            source_lang_detected: Some("en".to_string()),
-            tokens_used: 0,
-            cached: false,
-            elapsed_ms: 0.0,
-        })
+impl TranslationService {
+    pub fn new(
+        client: DeepSeekClient,
+        cache: Arc<TranslationCache>,
+        glossary: Arc<Glossary>,
+    ) -> Self {
+        Self {
+            client,
+            cache,
+            glossary,
+            protector: PlaceholderProtector::new(),
+        }
+    }
+
+    /// Run the full translation pipeline with optional streaming callback.
+    /// `on_chunk` is called with batched delta text (30-50ms intervals).
+    pub async fn translate(
+        &self,
+        request_id: &str,
+        source_text: &str,
+        target_lang: &str,
+        cancel_token: &CancellationToken,
+        on_chunk: &(dyn Fn(&str) + Send + Sync),
+    ) -> Result<TranslateResult, TranslateError> {
+        // 1. Normalize: detect language + protect placeholders
+        let norm = normalize::normalize(source_text);
+        let src_lang = norm.detected_lang.as_deref().unwrap_or("auto");
+        debug!(
+            src_lang = src_lang,
+            placeholder_count = norm.placeholders.len(),
+            "normalized"
+        );
+
+        // 2. Glossary: match entries against source text
+        let matched_glossary = self.glossary.match_entries(source_text);
+        debug!(matched_count = matched_glossary.len(), "glossary_matched");
+
+        // 3. Cache lookup
+        let cache_key = TranslationCache::compute_key(
+            src_lang,
+            target_lang,
+            self.glossary.version(),
+            &norm.normalized_text,
+        );
+        if let Some(cached) = self.cache.get(&cache_key) {
+            info!(request_id = request_id, "cache_hit");
+            on_chunk(&cached);
+            return Ok(TranslateResult {
+                request_id: request_id.to_string(),
+                translated_text: cached,
+                source_lang_detected: norm.detected_lang,
+                tokens_used: 0,
+                cached: true,
+                elapsed_ms: 0.0,
+            });
+        }
+
+        // 4. API call with streaming
+        let mut result = self
+            .client
+            .translate_stream(
+                &norm.normalized_text,
+                target_lang,
+                &matched_glossary,
+                cancel_token,
+                on_chunk,
+            )
+            .await?;
+
+        // 5. Restore placeholders in final text
+        result.translated_text = self
+            .protector
+            .restore(&result.translated_text, &norm.placeholders);
+        result.request_id = request_id.to_string();
+        result.source_lang_detected = norm.detected_lang;
+
+        // 6. Cache insert
+        self.cache.insert(cache_key, result.translated_text.clone());
+
+        info!(
+            request_id = request_id,
+            tokens = result.tokens_used,
+            elapsed_ms = result.elapsed_ms,
+            "translate_done"
+        );
+
+        Ok(result)
     }
 }

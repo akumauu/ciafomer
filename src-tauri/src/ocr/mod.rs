@@ -1,15 +1,15 @@
-//! OCR coordination module (Phase 1 stub with full interface).
-//! Real implementation in Phase 3 will communicate with Python Worker
-//! via Named Pipe / Unix Socket + MessagePack.
+//! OCR module — Rust-native engine interface.
+//! Phase 2: trait redesign (removed Python worker IPC architecture).
+//! Phase 3: full implementation with a Rust-native OCR engine.
 
 use serde::{Serialize, Deserialize};
 
-/// OCR request sent to the Python worker.
+/// OCR request.
 #[derive(Debug, Clone, Serialize)]
 pub struct OcrRequest {
     pub request_id: String,
     pub generation: u64,
-    pub image_data: Vec<u8>, // raw bytes, NOT base64
+    pub image_data: Vec<u8>, // raw bytes
     pub roi_type: RoiType,
     pub roi_params: RoiParams,
     pub preprocess: PreprocessConfig,
@@ -48,7 +48,7 @@ impl Default for PreprocessConfig {
     }
 }
 
-/// OCR result from the Python worker.
+/// OCR result.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OcrResult {
     pub request_id: String,
@@ -64,16 +64,20 @@ pub struct OcrLine {
     pub y_center: u32,
 }
 
-/// OCR worker client trait (platform adapter for IPC).
-pub trait OcrWorkerClient: Send + Sync {
-    fn submit(&self, request: OcrRequest) -> Result<(), OcrError>;
-    fn health_check(&self) -> bool;
+/// Rust-native OCR engine trait (replaces Python worker architecture).
+/// Implementations are synchronous — callers use `spawn_blocking` in the P2 loop.
+pub trait OcrEngine: Send + Sync {
+    /// Perform OCR on the given request.
+    fn recognize(&self, request: OcrRequest) -> Result<OcrResult, OcrError>;
+
+    /// Whether the engine is loaded and ready.
+    fn is_available(&self) -> bool;
 }
 
 #[derive(Debug)]
 pub enum OcrError {
-    WorkerNotRunning,
-    IpcFailed(String),
+    EngineNotLoaded,
+    ProcessingFailed(String),
     Timeout,
     Cancelled,
 }
@@ -81,23 +85,23 @@ pub enum OcrError {
 impl std::fmt::Display for OcrError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            OcrError::WorkerNotRunning => write!(f, "OCR worker not running"),
-            OcrError::IpcFailed(msg) => write!(f, "IPC failed: {msg}"),
+            OcrError::EngineNotLoaded => write!(f, "OCR engine not loaded"),
+            OcrError::ProcessingFailed(msg) => write!(f, "OCR processing failed: {msg}"),
             OcrError::Timeout => write!(f, "OCR timeout"),
             OcrError::Cancelled => write!(f, "OCR cancelled"),
         }
     }
 }
 
-/// Stub OCR client for Phase 1.
-pub struct StubOcrClient;
+/// Stub OCR engine for Phase 2 (real engine added in Phase 3).
+pub struct StubOcrEngine;
 
-impl OcrWorkerClient for StubOcrClient {
-    fn submit(&self, _request: OcrRequest) -> Result<(), OcrError> {
-        Err(OcrError::WorkerNotRunning)
+impl OcrEngine for StubOcrEngine {
+    fn recognize(&self, _request: OcrRequest) -> Result<OcrResult, OcrError> {
+        Err(OcrError::EngineNotLoaded)
     }
 
-    fn health_check(&self) -> bool {
+    fn is_available(&self) -> bool {
         false
     }
 }

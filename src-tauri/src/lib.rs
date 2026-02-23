@@ -11,14 +11,20 @@ pub mod ocr;
 pub mod translate;
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use std::collections::HashMap;
 use tauri::Manager;
-use tracing::info;
+use tracing::{info, warn};
 
 use state_machine::StateMachine;
-use scheduler::Scheduler;
+use scheduler::{Scheduler, P1Task};
 use cancellation::CancelCoordinator;
 use metrics::{MetricsRegistry, MetricSummary};
+use translate::cache::TranslationCache;
+use translate::glossary::Glossary;
+use translate::deepseek::DeepSeekClient;
+use translate::TranslationService;
+use capture::{TextCapture, ClipboardCapture};
 
 /// Shared application state managed by Tauri.
 pub struct AppContext {
@@ -26,6 +32,7 @@ pub struct AppContext {
     pub scheduler: Arc<Scheduler>,
     pub cancel: Arc<CancelCoordinator>,
     pub metrics: Arc<MetricsRegistry>,
+    pub translation_service: Option<Arc<TranslationService>>,
 }
 
 // --- Tauri Commands ---
@@ -51,7 +58,21 @@ fn select_mode(ctx: tauri::State<'_, AppContext>, mode: String) -> Result<String
     ctx.state_machine.set_mode(translate_mode);
     ctx.state_machine
         .transition(state_machine::AppState::Capture)
-        .map(|s| format!("{s}"))
+        .map_err(|e| e)?;
+
+    // For selection mode, immediately submit capture task to P1 (non-blocking)
+    if translate_mode == state_machine::TranslateMode::Selection {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let (_, generation) = ctx.cancel.p1.cancel_and_advance();
+        let p1_tx = ctx.scheduler.p1_sender();
+        let _ = p1_tx.try_send(P1Task::CaptureSelection {
+            request_id,
+            generation,
+            enqueued_at: Instant::now(),
+        });
+    }
+
+    Ok(format!("{}", ctx.state_machine.current()))
 }
 
 #[tauri::command]
@@ -64,6 +85,9 @@ fn cancel_current(ctx: tauri::State<'_, AppContext>) {
 fn dismiss(ctx: tauri::State<'_, AppContext>, app: tauri::AppHandle) {
     ctx.state_machine.force_sleep();
     if let Some(w) = app.get_webview_window("mode-panel") {
+        let _ = w.hide();
+    }
+    if let Some(w) = app.get_webview_window("result-panel") {
         let _ = w.hide();
     }
 }
@@ -87,11 +111,46 @@ pub fn run() {
     let state_machine = Arc::new(StateMachine::new());
     let scheduler = Arc::new(Scheduler::new(Arc::clone(&cancel), Arc::clone(&metrics)));
 
+    // Load glossary
+    let glossary_path = std::path::Path::new("glossary/default.json");
+    let glossary = Arc::new(
+        Glossary::load_from_file(glossary_path).unwrap_or_else(|e| {
+            warn!(error = %e, "glossary load failed, using empty");
+            Glossary::empty()
+        }),
+    );
+
+    // Create translation cache (512 entries, 10min TTL)
+    let cache = Arc::new(TranslationCache::new(512, Duration::from_secs(600)));
+
+    // Create DeepSeek client and translation service
+    let translation_service = match DeepSeekClient::new() {
+        Ok(client) => {
+            info!("DeepSeek API client initialized");
+            Some(Arc::new(TranslationService::new(
+                client,
+                Arc::clone(&cache),
+                Arc::clone(&glossary),
+            )))
+        }
+        Err(e) => {
+            warn!(error = %e, "DeepSeek client init failed (API key missing?), translation disabled");
+            None
+        }
+    };
+
+    // Create text capture (xdotool + xclip)
+    let capture: Arc<dyn TextCapture> = Arc::new(ClipboardCapture::new(
+        Duration::from_millis(60),
+        Duration::from_millis(200),
+    ));
+
     let app_context = AppContext {
         state_machine: Arc::clone(&state_machine),
         scheduler: Arc::clone(&scheduler),
         cancel: Arc::clone(&cancel),
         metrics: Arc::clone(&metrics),
+        translation_service: translation_service.clone(),
     };
 
     tauri::Builder::default()
@@ -109,6 +168,22 @@ pub fn run() {
                 handle.clone(),
             );
 
+            // Start P1 worker loop (Tokio task) if translation service is available
+            if let Some(ref ts) = translation_service {
+                scheduler::run_p1_loop(
+                    Arc::clone(&scheduler),
+                    Arc::clone(&state_machine),
+                    Arc::clone(&cancel),
+                    Arc::clone(&metrics),
+                    Arc::clone(ts),
+                    Arc::clone(&capture),
+                    handle.clone(),
+                );
+                info!("P1 worker loop started");
+            } else {
+                warn!("P1 worker loop not started (no translation service)");
+            }
+
             // Start audio pipeline
             let audio_config = audio::AudioConfig::default();
             match audio::start_audio_pipeline(
@@ -119,12 +194,9 @@ pub fn run() {
             ) {
                 Ok(_handle) => {
                     info!("audio pipeline started");
-                    // Store handle to keep pipeline alive
-                    // (leaked intentionally for app lifetime)
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "audio pipeline failed to start (may not have mic access)");
-                    // Non-fatal: app still works without wake, user can trigger manually
+                    warn!(error = %e, "audio pipeline failed to start (may not have mic access)");
                 }
             }
 

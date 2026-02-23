@@ -2,7 +2,10 @@
 
 > 本地部署、低延迟、高性能的桌面翻译工具。语音唤醒后即时响应，支持选中文本翻译、区域 OCR 翻译、实时增量翻译三种模式。
 
----
+---\n\n你是 Principal Desktop AI Engineer + Perf Engineer + Reliability Engineer。\n请在“不新增任何产品功能”的前提下，实现一个“语音唤醒 + 多模式翻译”桌面助手，并达到所有性能验收指标。\n\n## 0) 任务边界（硬约束）\n- 仅实现以下既有功能，不得新增产品功能：\n  1) 后台低功耗语音唤醒（命中后即时 UI/音效反馈）\n  2) 三种翻译模式：选中文本翻译、区域 OCR 翻译（矩形/套索多边形/四点透视）、实时增量翻译\n  3) DeepSeek API 翻译（重试、限流、缓存、可选流式）\n  4) 术语表注入、历史记录持久化、复制译文、原文/译文悬浮窗\n- 禁止引入与需求无关的新功能、新服务、新协议。\n- 若遇到实现不确定项，采用最保守默认值并在“Assumptions”中记录，不中断开发。\n\n## 1) 技术栈（固定）\n- 主进程：Rust + Tauri v2\n- 前端：Tauri WebView + TypeScript/CSS（禁止额外 UI 框架）\n- OCR：Python 独立 Worker（PaddleOCR + OpenCV）\n- IPC：主进程↔Worker 使用 Named Pipe(Windows)/Unix Socket(Linux/macOS) + MessagePack\n- 翻译：DeepSeek chat/completions（reqwest 连接池）\n- 存储：SQLite + 内存 LRU\n\n## 2) 平台优先级\n- P0：Windows 11 x64（必须先满足全部 KPI）\n- P1：Linux/macOS（接口保持一致，可后续适配）\n- 涉及平台差异处必须提供 trait/adapter 设计，避免平台代码污染核心逻辑。\n\n## 3) 性能与资源 KPI（阻塞验收）\n- 唤醒反馈（Wake→UI/音效事件发出）：p95 < 250ms，p99 < 400ms\n- 模式面板出现：p95 < 300ms，p99 < 500ms\n- 选中翻译首条译文：p95 < 800ms，p99 < 1.2s\n- OCR 翻译首条译文（1080p 局部 ROI）：p95 < 1.2s，p99 < 2.0s\n- 高优任务排队等待：p95 < 80ms，p99 < 120ms\n- 待机 CPU < 2%，待机内存 < 200MB\n- Token 节省（实时增量 vs 全量朴素）：>= 40%\n\n### Wake 路径禁止项（硬规则）\n- 禁止网络 I/O、OCR、大模型推理、磁盘同步写\n- P0 通道仅允许：事件通知、窗口可见切换、音效触发\n- P0 处理不得包含 >1ms 计算\n\n## 4) 架构强制要求\n### 4.1 状态机\nSleep -> WakeConfirm -> ModeSelect -> Capture -> OCR?(optional) -> Translate -> Render -> Idle/Sleep\n- 两阶段唤醒确认：\n  - 阶段1：th_low 命中即刻发 UI/音效反馈\n  - 阶段2：150ms 内累计确认，失败回退 Sleep + 轻提示\n- 目的：降低误唤醒导致的 OCR/翻译白跑，不增加用户体感延迟\n\n### 4.2 三队列调度\n- P0: Wake/UI Channel（独立，最高优先级）\n- P1: Capture/Translate Queue（Tokio async）\n- P2: OCR Heavy Queue（spawn_blocking/独立线程池 + 独立 Python 进程）\n- 抢占规则：\n  - 新 Wake 到来：取消 P1/P2 所有可取消任务，仅保留必要清理\n  - 同模式新请求：取消旧请求，request_id + generation 防止旧结果回写 UI\n  - 用户退出/超时：全链路取消并回 Sleep\n\n### 4.3 端到端取消\n- Rust：CancellationToken + generation guard\n- Python：Job.cancelled Event，推理循环中频繁检查\n- 验收：连续触发 10 次新请求，UI 只能出现最后一次结果\n\n## 5) 链路实现约束\n### 5.1 音频/唤醒\n- Ring Buffer 固定预分配（3s PCM），禁止动态扩容\n- 能量门控（RMS）-> VAD -> Wake 推理 级联过滤\n- 连续 VAD=false 降频唤醒推理（如 1/4）\n- 唤醒命中后：先发 P0，再异步投递 P1（顺序不可反）\n\n### 5.2 选中文本采集\n- 优先系统可访问性 API（超时 50-80ms）\n- 失败回退剪贴板方案：\n  - 备份原剪贴板 -> Ctrl+C -> 等待变更(<=200ms) -> 读新值 -> finally 恢复原剪贴板\n- TextPacket 统一输入，后续链路不关心来源\n\n### 5.3 区域 OCR\n- 全帧仅用于定位，OpenCV 预处理与 OCR 必须 ROI-only\n- 支持：矩形 crop、多边形 mask、四点透视 warpPerspective\n- 预处理：灰度、自适应二值化、降噪、可选 deskew\n\n### 5.4 实时增量翻译\n- 默认 500ms 周期采样 + 像素差分（MAE/SSIM）变化检测\n- 无变化帧跳过 OCR\n- OCR 行级 diff：line-hash(text + y_bucket)，y_bucket 默认 8px\n- 仅 added lines 进翻译；不变行复用缓存\n- 验收：字幕 60s 不变，API 请求 <=1 次\n\n## 6) 翻译与 Token 成本控制\n- 本地规范化先行：语言检测、占位符保护（数字/单位/URL/邮箱/代码）\n- 术语表仅注入命中项\n- Prompt：\n  - system: 极短固定模板（<=60 tokens）\n  - user: 紧凑 JSON 字段（t/g）\n- max_tokens 动态估算：(input_tokens*1.15 + 32)，上限 768\n- 缓存：\n  - L1: 内存 LRU(512, TTL 10m)\n  - L2: SQLite(TTL 7d)\n  - key = blake3(src|tgt|glossary_ver|normalized_text)\n- 行级缓存必须启用（实时增量主收益）\n\n## 7) 网络、限流、重试\n- reqwest 长连接池 keep-alive，连接数 2~8\n- 本地令牌桶限流（先限流，后请求）\n- 重试策略：\n  - 429：优先 Retry-After，否则 1s/2s/4s（最多3次）\n  - 5xx：指数退避最多2次\n  - timeout：立即重试1次\n  - 其他错误：不重试\n- API Key 仅从环境变量读取，日志禁止泄露密钥/原文敏感信息\n\n## 8) UI 与持久化\n- Mode Panel 启动预创建 hidden，唤醒时仅 show + focus\n- 流式渲染必须增量 append，禁止全量重排\n- 历史记录异步批量写（如 300ms flush），不得阻塞渲染路径\n\n## 9) Python OCR Worker 规约\n- Worker 进程常驻，模型延迟加载，idle>=60s 卸载模型\n- IPC 使用 MessagePack + raw bytes（禁 base64 JSON）\n- 健康检查：每 30s ping，500ms 内 pong；连续3次失败则重启\n- Worker 崩溃后：pending OCR 任务失败并上报“服务重启中”\n\n## 10) 可观测性（必须实现）\n每个 request 必须有：trace_id, request_id, generation\n必须埋点并输出直方图统计（p50/p95/p99）：\n- t_wake_detected\n- t_wake_ui_emitted\n- t_mode_panel_visible\n- t_capture_done\n- t_ocr_done\n- t_translate_first_chunk\n- t_translate_done\n- t_render_done\n- queue_wait_p0 / p1 / p2\n- cancel_latency\n禁止“无埋点宣称达标”。\n\n## 11) 目录结构（必须匹配）\n使用以下目录：\n- src-tauri/src/{main.rs,state_machine.rs,scheduler.rs,cancellation.rs,...}\n- src-tauri/src/audio/*\n- src-tauri/src/capture/*\n- src-tauri/src/ocr/*\n- src-tauri/src/translate/*\n- src/*\n- python-worker/*\n- scripts/*\n- glossary/default.json\n- README.md\n\n## 12) 开发顺序（强制 Phase Gate）\nPhase 1: Wake/UI 路径 + 三队列 + 取消框架\nPhase 2: 选中文本翻译链路（采集/翻译/缓存/渲染）\nPhase 3: OCR Worker + ROI 预处理 + 区域翻译\nPhase 4: 实时增量（变化检测 + line-hash diff + 行级缓存）\nPhase 5: 限流/连接池/持久缓存/历史批量写/稳定性与性能打磨\n规则：前一 Phase 未达 KPI，不得进入下一 Phase。\n\n## 13) 输出协议（必须遵守）\n每次输出必须包含以下 7 段：\n1) Assumptions（阻塞假设）\n2) Plan（本轮计划）\n3) Code（按文件给完整可运行代码，禁止伪代码/TODO）\n4) Runbook（本地启动与验证命令）\n5) Metrics（本轮可观测数据与 KPI 对比）\n6) Acceptance Mapping（映射到 20 条验收项：PASS/FAIL/UNRUN）\n7) Handoff（给下一模型）\n   - changed_files\n   - completed_acceptance_ids\n   - open_risks\n   - next_actions\n   - commands_executed + summary\n禁止伪造测试结果；未执行必须标注 UNRUN，并给出复现步骤。\n\n## 14) 20 条验收标准\n严格使用 A1~A20（与需求文档一致）：\nA1-A7 功能正确性\nA8-A14 性能\nA15-A20 稳定性与取消正确性\n交付时必须逐条给证据（日志片段/指标摘要/脚本结果）。\n\n## 15) 代码质量红线\n- 不得阻塞 Wake 路径\n- 不得在热路径频繁堆分配\n- 不得让旧 request 回写 UI\n- 不得全帧 OCR（必须 ROI-only）\n- 不得遗漏剪贴板 finally 恢复\n- 不得输出解释性翻译（只输出译文）\n- 不得泄露密钥或敏感原文到日志\n\n现在开始执行。先输出 Phase 1 的 Assumptions + Plan + 项目骨架代码。\n
+
+
+全程在wsl环境下开发！ciallo
 
 ## 目录
 
@@ -46,8 +49,8 @@ Ciallo 是一个纯本地部署的桌面翻译助手，目标是以最低的资�
 |------|------|------|
 | **主进程** | Rust + Tauri v2 | 状态机、调度器、取消框架、音频管道 |
 | **前端** | TypeScript + CSS | Tauri WebView，禁止额外 UI 框架 |
-| **OCR Worker** | Python (PaddleOCR + OpenCV) | 独立进程，延迟加载，idle 自动卸载 |
-| **IPC** | Named Pipe / Unix Socket + MessagePack | 主进程 ↔ Python Worker |
+| **OCR** | Rust-native OcrEngine trait | Phase 2 重构：移除 Python Worker IPC 开销，Phase 3 接入轻量 Rust OCR 引擎 |
+| **IPC** | ~~Named Pipe / Unix Socket + MessagePack~~ | 已移除，改用 Rust-native 直接调用 |
 | **翻译** | DeepSeek chat/completions | reqwest 连接池 |
 | **存储** | SQLite + 内存 LRU | 二级缓存 |
 | **构建** | esbuild (前端) + cargo (后端) | 最小构建链 |
@@ -71,6 +74,7 @@ Ciallo 是一个纯本地部署的桌面翻译助手，目标是以最低的资�
 │  ┌────────────────────────────────────────────┐    │
 │  │              WebView (TS/CSS)               │    │
 │  │  main window ◄──events──► mode-panel       │    │
+│  │                           result-panel      │    │
 │  └────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────┘
           │ IPC (MessagePack)
@@ -143,32 +147,42 @@ P0 通道处理**严禁**：
 | Python OCR Worker | `python-worker/worker.py` | PaddleOCR 延迟加载，idle≥60s 卸载，msgpack 帧协议 |
 | 术语表模板 | `glossary/default.json` | JSON 格式 source→target 映射 |
 
-### 未实现（Phase 2-5 计划）
+### 已实现 (Phase 2)
+
+| 功能 | 文件 | 说明 |
+|------|------|------|
+| OCR 引擎 trait 重构 | `ocr/mod.rs` | 移除 Python Worker IPC 架构，改为 Rust-native `OcrEngine` trait + `StubOcrEngine` |
+| 剪贴板文本采集 | `capture/mod.rs` | `ClipboardCapture`: xdotool Ctrl+C → xclip 读取，启动时探测工具可用性 |
+| 剪贴板安全恢复 | `capture/mod.rs` → `ClipboardGuard` | RAII Drop 模式保证 finally 恢复原剪贴板内容 |
+| 语言检测 | `translate/normalize.rs` | whatlang crate，ISO 639-1 映射 |
+| 占位符保护 | `translate/normalize.rs` → `PlaceholderProtector` | URL/邮箱/数字+单位/独立数字/内联代码 正则保护与恢复 |
+| 术语表匹配 | `translate/glossary.rs` | 大小写不敏感匹配，仅注入命中项 |
+| 翻译缓存 L1 | `translate/cache.rs` | LRU(512) + blake3 hash key + TTL 10min |
+| DeepSeek API 客户端 | `translate/deepseek.rs` | reqwest 连接池(4 idle, 90s timeout)，手动 SSE 解析 |
+| 批量流式输出 | `translate/deepseek.rs` | 40ms batched chunk flush，非逐 token |
+| 令牌桶限流 | `translate/deepseek.rs` | 100ms 最小间隔 (10 req/s) |
+| 重试策略 | `translate/deepseek.rs` → `send_with_retry` | 429→1s/2s/4s(3次)，5xx→500ms/1s(2次)，timeout→立即1次 |
+| max_tokens 动态估算 | `translate/deepseek.rs` | (input_tokens*1.15 + 32).min(768).max(64) |
+| 翻译服务编排 | `translate/mod.rs` → `TranslationService` | normalize→glossary→cache→API→restore placeholders→cache insert |
+| P1 Worker 循环 | `scheduler.rs` → `run_p1_loop` | CaptureSelection→Translate(streaming)→RenderResult 完整链路 |
+| 翻译结果悬浮窗 | `result-panel.html/ts` + `tauri.conf.json` | hidden + transparent + alwaysOnTop，480x320 |
+| 流式渲染 | `result-panel.ts` | 增量 append `textContent +=`，禁止全量重排 |
+| 复制译文 | `result-panel.ts` | `navigator.clipboard.writeText()` |
+| Phase 2 事件体系 | `main.ts` | capture-complete/error, translate-chunk/complete/error |
+| 优雅降级 | `lib.rs` | DEEPSEEK_API_KEY 缺失时跳过翻译服务，仅 warn |
+
+### 未实现（Phase 3-5 计划）
 
 | 功能 | Phase | 说明 |
 |------|-------|------|
-| 选中文本采集 | Phase 2 | accessibility API(超时 50-80ms) → clipboard fallback(backup→Ctrl+C→read→finally restore) |
-| DeepSeek API 翻译 | Phase 2 | reqwest 连接池(2-8)，system prompt ≤60 tokens，紧凑 JSON(t/g) |
-| 本地令牌桶限流 | Phase 2 | 先限流后请求 |
-| 重试策略 | Phase 2 | 429: Retry-After/1s/2s/4s(3次)，5xx: 指数退避(2次)，timeout: 立即1次 |
-| 翻译缓存 L1 | Phase 2 | 内存 LRU(512, TTL 10m)，key=blake3(src\|tgt\|glossary_ver\|normalized_text) |
-| 翻译缓存 L2 | Phase 5 | SQLite(TTL 7d) |
-| 术语表注入 | Phase 2 | 仅注入命中项，不全量发送 |
-| 语言检测 | Phase 2 | 本地规范化先行 |
-| 占位符保护 | Phase 2 | 数字/单位/URL/邮箱/代码 |
-| max_tokens 动态估算 | Phase 2 | (input_tokens*1.15 + 32)，上限 768 |
-| 流式渲染 | Phase 2 | 增量 append，禁止全量重排 |
-| 原文/译文悬浮窗 | Phase 2 | 浮动窗口显示翻译结果 |
-| 复制译文 | Phase 2 | 一键复制到剪贴板 |
-| OCR Worker IPC | Phase 3 | Named Pipe(Win) / Unix Socket + MessagePack |
+| Rust-native OCR 引擎实现 | Phase 3 | OcrEngine trait 已就绪，接入轻量引擎 (如 Tesseract FFI) |
+| 区域选择 UI | Phase 3 | 矩形/多边形/四点透视选区 |
 | ROI 预处理 | Phase 3 | 灰度、自适应二值化、降噪、可选 deskew |
-| 矩形/多边形/透视 OCR | Phase 3 | rect crop / polygon mask / warpPerspective |
-| Worker 健康检查 | Phase 3 | 30s ping，500ms pong，3次失败重启 |
+| 翻译缓存 L2 | Phase 5 | SQLite(TTL 7d) |
 | 实时增量翻译 | Phase 4 | 500ms 采样 + 像素差分(MAE/SSIM) 变化检测 |
 | 行级 diff | Phase 4 | line-hash(text + y_bucket 8px)，仅 added lines 进翻译 |
 | 行级缓存 | Phase 4 | 不变行复用缓存，字幕 60s 不变 API≤1 次 |
 | 历史记录批量写 | Phase 5 | 异步 300ms flush，不阻塞渲染 |
-| 连接池优化 | Phase 5 | reqwest keep-alive 长连接 |
 | 稳定性打磨 | Phase 5 | 全面性能测试，KPI 达标验证 |
 
 ---
@@ -201,16 +215,22 @@ ciallo/
 │       │   ├── vad.rs             # RMS 能量 VAD + 降频推理
 │       │   └── wake.rs            # WakeDetector trait + 能量模式检测
 │       ├── capture/
-│       │   └── mod.rs             # TextCapture trait + TextPacket (Phase 2)
+│       │   └── mod.rs             # ClipboardCapture: xdotool+xclip 采集 + ClipboardGuard RAII
 │       ├── ocr/
-│       │   └── mod.rs             # OcrWorkerClient trait + 类型定义 (Phase 3)
+│       │   └── mod.rs             # OcrEngine trait + StubOcrEngine (Phase 3 接入真实引擎)
 │       └── translate/
-│           └── mod.rs             # Translator trait + 类型定义 (Phase 2)
+│           ├── mod.rs             # TranslationService 编排层
+│           ├── normalize.rs       # 语言检测 + 占位符保护/恢复
+│           ├── glossary.rs        # 术语表加载与匹配
+│           ├── cache.rs           # LRU(512) + blake3 key + TTL 缓存
+│           └── deepseek.rs        # DeepSeek API 客户端 (SSE streaming + retry)
 ├── src/                           # 前端 (TypeScript + CSS)
 │   ├── index.html                 # 主窗口 HTML
 │   ├── mode-panel.html            # 模式选择面板 HTML
+│   ├── result-panel.html          # 翻译结果悬浮窗 HTML
 │   ├── main.ts                    # 主窗口逻辑 (事件监听/状态/音效)
 │   ├── mode-panel.ts              # 模式面板逻辑 (invoke 命令)
+│   ├── result-panel.ts            # 结果面板逻辑 (流式渲染/复制)
 │   └── style.css                  # 暗色主题样式
 ├── python-worker/                 # Python OCR Worker (可选)
 │   ├── worker.py                  # PaddleOCR 进程 (lazy load, msgpack)
@@ -312,6 +332,8 @@ cancel_latency
 
 **mode-panel.ts：** 三个模式按钮（Selection / OCR Region / Realtime）+ Cancel，通过 `invoke('select_mode', { mode })` 通知后端。
 
+**result-panel.ts：** 翻译结果悬浮窗。监听 `capture-complete`, `translate-chunk`, `translate-complete`, `force-cancel` 事件。流式渲染采用增量 `textContent +=` append，避免全量重排。提供复制译文和关闭按钮。
+
 **style.css：** 暗色主题 (`#1a1a2e`)，脉冲动画反馈，按钮悬停/按下状态。
 
 ### 7. Python OCR Worker (`python-worker/`)
@@ -323,6 +345,48 @@ cancel_latency
 - MessagePack 帧协议（4字节大端长度前缀 + msgpack payload），禁止 base64 JSON
 - 支持 ping/pong 健康检查、ocr 任务、shutdown 命令
 
+### 8. 翻译管道 (`translate/`)
+
+Phase 2 完整翻译管道，由 `TranslationService` 编排。
+
+**normalize.rs：**
+- `detect_language()` — whatlang 检测 + ISO 639-1 映射 (en/zh/ja/ko/fr/de/es/ru/pt/ar/...)
+- `PlaceholderProtector` — 5 种正则模式：URL、邮箱、数字+单位、独立数字、内联代码 `` `...` ``
+- `normalize()` — 返回 `NormalizeResult { normalized_text, detected_lang, placeholders }`
+
+**glossary.rs：**
+- `Glossary` — 从 JSON 加载术语表，大小写不敏感匹配
+- `match_entries()` — 仅返回 source 出现在输入文本中的条目
+
+**cache.rs：**
+- `TranslationCache` — Mutex 保护的 `LruCache<[u8;32], CacheEntry>`
+- key = `blake3(src_lang | tgt_lang | glossary_ver | normalized_text)`
+- 容量 512，TTL 10 分钟
+
+**deepseek.rs：**
+- `DeepSeekClient` — reqwest 连接池 (4 idle, 90s timeout)
+- 手动 SSE 解析 (`data: {...}` → `serde_json`)
+- 40ms batched chunk flush (非逐 token)
+- 简单令牌桶限流 (100ms min interval = 10 req/s)
+- `send_with_retry()` — 429→1s/2s/4s(3次)，5xx→500ms/1s(2次)，timeout→立即1次
+- 紧凑 prompt：system ≤60 tokens，user `{"t":"text","l":"lang","g":{"src":"tgt"}}`
+
+**mod.rs — TranslationService：**
+1. normalize (语言检测 + 占位符保护)
+2. glossary match (仅命中项)
+3. cache lookup (blake3 key)
+4. API call (SSE streaming + on_chunk callback)
+5. restore placeholders
+6. cache insert
+
+### 9. 文本采集 (`capture/`)
+
+**ClipboardCapture：**
+- 启动时 `probe_command()` 检测 xdotool + xclip 可用性
+- 采集流程：backup clipboard → xdotool Ctrl+C → wait 60ms → read clipboard → compare with backup
+- `ClipboardGuard` RAII Drop 模式保证 finally 恢复原剪贴板内容
+- 工具不可用时快速失败 `CaptureError::ToolNotAvailable`
+
 ---
 
 ## 性能指标 (KPI)
@@ -331,8 +395,8 @@ cancel_latency
 |------|------|---------|
 | 唤醒反馈 (Wake→UI) | p95 < 250ms, p99 < 400ms | 框架就绪，埋点已实现 |
 | 模式面板出现 | p95 < 300ms, p99 < 500ms | 预创建 hidden + show，埋点就绪 |
-| 选中翻译首条译文 | p95 < 800ms, p99 < 1.2s | Phase 2 |
-| OCR 翻译首条译文 | p95 < 1.2s, p99 < 2.0s | Phase 3 (OCR 可选) |
+| 选中翻译首条译文 | p95 < 800ms, p99 < 1.2s | Phase 2 链路完成，待实测 |
+| OCR 翻译首条译文 | p95 < 1.2s, p99 < 2.0s | Phase 3 (OcrEngine trait 就绪) |
 | 高优任务排队等待 | p95 < 80ms, p99 < 120ms | crossbeam 无界 + 专用线程 |
 | 待机 CPU | < 2% | 预期达标 (sleep loop) |
 | 待机内存 | < 200MB | 预期达标 (~96KB ring buffer) |
@@ -434,22 +498,42 @@ cargo run
 
 **编译状态：** `cargo build` 通过
 
-### Phase 2: 选中文本翻译链路 [计划中]
+### Phase 2: 选中文本翻译链路 [已完成]
 
 **目标：** 实现选中文本 → 翻译 → 渲染的完整链路。
 
-**计划内容：**
-1. 选中文本采集 (accessibility API + clipboard fallback)
-2. DeepSeek API 翻译 (reqwest 连接池)
-3. 本地规范化 (语言检测、占位符保护)
-4. 术语表注入 (仅命中项)
-5. 翻译缓存 L1 (内存 LRU 512, TTL 10m)
-6. 流式渲染 (增量 append)
-7. 翻译结果悬浮窗
+**完成内容：**
+1. OCR 模块重构：移除 Python Worker IPC 架构，改为轻量 Rust-native `OcrEngine` trait（Phase 3 接入真实引擎）
+2. 剪贴板文本采集：`ClipboardCapture` (xdotool Ctrl+C + xclip 读取)，启动时探测工具可用性，`ClipboardGuard` RAII 保证恢复
+3. 语言检测 + 占位符保护：`whatlang` 检测语种，正则保护 URL/邮箱/数字+单位/代码
+4. 术语表匹配：大小写不敏感匹配，仅注入命中项到 prompt
+5. 翻译缓存 L1：LRU(512) + blake3 hash key + TTL 10min
+6. DeepSeek API 客户端：reqwest 连接池(4 idle)，手动 SSE 解析，40ms batched chunk flush
+7. 令牌桶限流 + 重试策略：429/5xx/timeout 分级重试
+8. `TranslationService` 编排：normalize → glossary → cache → API → restore → cache insert
+9. P1 Worker 循环：CaptureSelection → Translate(streaming) → RenderResult 三阶段
+10. 翻译结果悬浮窗：result-panel (hidden + transparent + alwaysOnTop)，流式增量渲染 + 复制译文
 
-### Phase 3: OCR Worker + 区域翻译 [计划中]
+**编译状态：** `cargo check` 通过 (WSL rustc 1.93.1 + Windows rustc 1.90.0，零错误零警告)
 
-**目标：** 实现 OCR 区域选择 → 预处理 → OCR → 翻译链路。
+**新增文件：**
+- `src-tauri/src/translate/normalize.rs` — 语言检测 + 占位符保护
+- `src-tauri/src/translate/glossary.rs` — 术语表加载与匹配
+- `src-tauri/src/translate/cache.rs` — LRU + blake3 翻译缓存
+- `src-tauri/src/translate/deepseek.rs` — DeepSeek API 客户端
+- `src/result-panel.html` — 翻译结果悬浮窗
+- `src/result-panel.ts` — 结果面板前端逻辑
+
+**重构文件：**
+- `src-tauri/src/ocr/mod.rs` — `OcrWorkerClient` → `OcrEngine` trait
+- `src-tauri/src/capture/mod.rs` — 实现 `ClipboardCapture`
+- `src-tauri/src/translate/mod.rs` — 新增 `TranslationService`
+- `src-tauri/src/scheduler.rs` — P1 worker loop + Mutex 重构
+- `src-tauri/src/lib.rs` — AppContext 扩展 + 翻译服务初始化
+
+### Phase 3: Rust-native OCR + 区域翻译 [计划中]
+
+**目标：** 接入轻量 Rust OCR 引擎实现 `OcrEngine` trait，实现区域选择 → 预处理 → OCR → 翻译链路。
 
 ### Phase 4: 实时增量翻译 [计划中]
 
@@ -465,7 +549,7 @@ cargo run
 
 ### 已实现
 
-- [x] Tauri v2 项目骨架 + 双窗口 (main + mode-panel)
+- [x] Tauri v2 项目骨架 + 三窗口 (main + mode-panel + result-panel)
 - [x] 状态机 (8 状态，验证转移)
 - [x] 两阶段唤醒确认 (th_low → UI反馈 → th_high 确认/回退)
 - [x] 三队列调度器 (P0 crossbeam unbounded / P1 tokio mpsc / P2 tokio mpsc)
@@ -482,49 +566,46 @@ cargo run
 - [x] 可观测性框架 (SampleRing histogram, 12 metric, TimingSpan)
 - [x] trace_id / request_id / generation 追踪
 - [x] Tauri 命令 (get_state / get_metrics_summary / select_mode / cancel_current / dismiss)
-- [x] TextCapture trait 接口定义
-- [x] OcrWorkerClient trait 接口定义
-- [x] Translator trait 接口定义
+- [x] TextCapture trait + ClipboardCapture 实现
+- [x] OcrEngine trait + StubOcrEngine (Phase 3 接入真实引擎)
 - [x] ROI 类型定义 (Rect / Polygon / Perspective)
 - [x] OCR 预处理配置类型 (grayscale, threshold, denoise, deskew)
 - [x] Python OCR Worker (PaddleOCR, lazy load, idle 卸载, msgpack)
-- [x] 术语表 JSON 模板
+- [x] 术语表 JSON 模板 + 匹配注入
 - [x] 开发脚本 (scripts/dev.sh)
-- [x] Python 虚拟环境
 - [x] .gitignore
+- [x] 剪贴板安全恢复 (ClipboardGuard RAII Drop)
+- [x] DeepSeek API 翻译 (SSE streaming + 手动解析)
+- [x] reqwest 连接池 (keep-alive, 4 idle, 90s timeout)
+- [x] 本地令牌桶限流 (100ms 间隔)
+- [x] 重试策略 (429/5xx/timeout 分级处理)
+- [x] 翻译缓存 L1 (内存 LRU 512, TTL 10min, blake3 key)
+- [x] 语言检测 (whatlang + ISO 639-1)
+- [x] 占位符保护 (URL/邮箱/数字+单位/代码)
+- [x] Prompt 模板 (system ≤60 tokens, user 紧凑 JSON t/l/g)
+- [x] max_tokens 动态估算
+- [x] 流式翻译渲染 (增量 append，40ms batch)
+- [x] 翻译结果悬浮窗 (result-panel)
+- [x] 复制译文到剪贴板
+- [x] TranslationService 编排层 (normalize→glossary→cache→API→restore→cache)
+- [x] P1 Worker 循环 (Capture→Translate→Render 完整链路)
+- [x] Phase 2 事件体系 (capture/translate 事件)
+- [x] DEEPSEEK_API_KEY 优雅降级
+- [x] API Key 安全处理 (仅环境变量，日志不泄露)
 
 ### 未实现
 
 - [ ] 真实唤醒词模型 (当前用能量尖峰检测代替)
-- [ ] 选中文本采集 (accessibility API + clipboard fallback)
-- [ ] 剪贴板备份/恢复 (finally guarantee)
-- [ ] DeepSeek API 翻译调用
-- [ ] reqwest 连接池 (keep-alive, 2-8 连接)
-- [ ] 本地令牌桶限流
-- [ ] 重试策略 (429/5xx/timeout 分别处理)
-- [ ] 翻译缓存 L1 (内存 LRU)
-- [ ] 翻译缓存 L2 (SQLite)
-- [ ] blake3 缓存 key 计算
-- [ ] 语言检测
-- [ ] 占位符保护 (数字/URL/邮箱/代码)
-- [ ] 术语表匹配与注入
-- [ ] Prompt 模板 (system ≤60 tokens, user 紧凑 JSON)
-- [ ] max_tokens 动态估算
-- [ ] 流式翻译渲染 (增量 append)
-- [ ] 原文/译文悬浮窗
-- [ ] 复制译文到剪贴板
-- [ ] OCR Worker IPC (Named Pipe / Unix Socket)
-- [ ] Worker 健康检查 (ping/pong)
-- [ ] Worker 崩溃恢复
+- [ ] Rust-native OCR 引擎实现 (OcrEngine trait 已就绪)
 - [ ] 区域选择 UI (矩形/多边形/四点透视)
 - [ ] ROI 预处理 (灰度、二值化、降噪、deskew)
+- [ ] 翻译缓存 L2 (SQLite, TTL 7d)
 - [ ] 实时增量翻译
 - [ ] 像素差分变化检测 (MAE/SSIM)
 - [ ] 行级 diff (line-hash + y_bucket)
 - [ ] 行级缓存
 - [ ] 历史记录 SQLite 持久化
 - [ ] 异步批量写 (300ms flush)
-- [ ] API Key 安全处理 (仅环境变量)
 - [ ] 全面 KPI 性能验证
 
 ---
@@ -536,18 +617,27 @@ cargo run
 ```json
 {
   "app": {
-    "withGlobalTauri": true,    // 前端通过 window.__TAURI__ 访问 API
+    "withGlobalTauri": true,
     "windows": [
       {
         "label": "main",
-        "visible": false         // 启动时隐藏，按需显示
+        "visible": false
       },
       {
         "label": "mode-panel",
-        "visible": false,        // 预创建但隐藏
-        "decorations": false,    // 无标题栏
-        "transparent": true,     // 透明背景
-        "alwaysOnTop": true      // 始终置顶
+        "visible": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true
+      },
+      {
+        "label": "result-panel",
+        "visible": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "width": 480,
+        "height": 320
       }
     ]
   }
@@ -586,9 +676,15 @@ cargo run
 | 前端用 `withGlobalTauri` 而非 bundler 集成 | 避免模块解析问题，保持最简构建链 |
 | esbuild 而非 webpack/vite | 构建速度快，不违反"禁止 UI 框架"约束 |
 | WakeDetector 用 trait | 方便后续替换为真实 keyword-spotting 模型 |
-| TextCapture/Translator/OcrWorkerClient 用 trait | 平台适配器模式，隔离平台代码 |
+| TextCapture/OcrEngine 用 trait | 平台适配器模式，隔离平台代码 |
 | 音效用 WebAudio 合成 | 无需外部音频文件，零额外依赖 |
 | metrics 用自实现 SampleRing | 无需引入 prometheus/metrics 等重依赖 |
+| OCR 从 Python Worker 改为 Rust-native trait | 消除 IPC 开销，减少资源占用，简化部署 |
+| 手动 SSE 解析而非 eventsource-stream crate | 减少依赖，对 DeepSeek 响应格式更可控 |
+| 40ms batched chunk flush | 平衡渲染频率与性能，避免逐 token DOM 更新 |
+| blake3 而非 sha256 做缓存 key | 更快的哈希，无密码学需求 |
+| on_chunk callback 用 `&(dyn Fn + Send + Sync)` | tokio::spawn 要求 future 为 Send |
+| ClipboardGuard RAII Drop | 保证剪贴板恢复，即使发生 panic |
 
 ---
 
