@@ -146,6 +146,24 @@ async function init(): Promise<void> {
     showFeedback('Translation failed: ' + data.error);
   });
 
+  // Phase 3: OCR pipeline events
+  await listen('ocr-started', () => {
+    setStatus('Ocr');
+    showFeedback('Running OCR...');
+  });
+
+  await listen('ocr-complete', (event: { payload: unknown }) => {
+    const data = event.payload as { text: string; lines: number; elapsed_ms: number };
+    setStatus('Translate');
+    showFeedback(`OCR: ${data.lines} lines in ${Math.round(data.elapsed_ms)}ms. Translating...`);
+  });
+
+  await listen('ocr-error', (event: { payload: unknown }) => {
+    const data = event.payload as { error: string };
+    setStatus('Sleep');
+    showFeedback('OCR failed: ' + data.error);
+  });
+
   // Initial state
   const state = await invoke('get_state') as string;
   setStatus(state as AppState);

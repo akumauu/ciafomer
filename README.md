@@ -49,8 +49,8 @@ Ciallo 是一个纯本地部署的桌面翻译助手，目标是以最低的资�
 |------|------|------|
 | **主进程** | Rust + Tauri v2 | 状态机、调度器、取消框架、音频管道 |
 | **前端** | TypeScript + CSS | Tauri WebView，禁止额外 UI 框架 |
-| **OCR** | Rust-native OcrEngine trait | Phase 2 重构：移除 Python Worker IPC 开销，Phase 3 接入轻量 Rust OCR 引擎 |
-| **IPC** | ~~Named Pipe / Unix Socket + MessagePack~~ | 已移除，改用 Rust-native 直接调用 |
+| **OCR** | Python Worker (PaddleOCR + OpenCV) | Phase 3: stdin/stdout IPC + MessagePack 帧协议，ROI 预处理 |
+| **IPC** | stdin/stdout + MessagePack (4字节大端长度前缀) | 主进程↔Python Worker 通信 |
 | **翻译** | DeepSeek chat/completions | reqwest 连接池 |
 | **存储** | SQLite + 内存 LRU | 二级缓存 |
 | **构建** | esbuild (前端) + cargo (后端) | 最小构建链 |
@@ -75,14 +75,15 @@ Ciallo 是一个纯本地部署的桌面翻译助手，目标是以最低的资�
 │  │              WebView (TS/CSS)               │    │
 │  │  main window ◄──events──► mode-panel       │    │
 │  │                           result-panel      │    │
+│  │                           capture-overlay   │    │
 │  └────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────┘
-          │ IPC (MessagePack)
-    ┌─────▼─────┐
-    │ Python    │
-    │ OCR       │
-    │ Worker    │
-    └───────────┘
+│         │ IPC (stdin/stdout + MessagePack)
+│   ┌─────▼─────┐
+│   │ Python    │
+│   │ OCR       │
+│   │ Worker    │
+│   └───────────┘
 ```
 
 ### 状态机
@@ -143,7 +144,7 @@ P0 通道处理**严禁**：
 | 可观测性框架 | `metrics.rs` | SampleRing(1024) histogram, p50/p95/p99, 12 个命名指标 |
 | Timing Span | `metrics.rs` → `TimingSpan` | 自动计时并记录到 histogram |
 | trace_id/request_id | `metrics.rs` → `RequestIds` | 每请求唯一标识 (UUID v4) |
-| Tauri 命令 | `lib.rs` | get_state / get_metrics_summary / select_mode / cancel_current / dismiss |
+| Tauri 命令 | `lib.rs` | get_state / get_metrics_summary / select_mode / cancel_current / dismiss / get_screenshot_base64 / submit_ocr_selection / cancel_ocr_capture |
 | Python OCR Worker | `python-worker/worker.py` | PaddleOCR 延迟加载，idle≥60s 卸载，msgpack 帧协议 |
 | 术语表模板 | `glossary/default.json` | JSON 格式 source→target 映射 |
 
@@ -151,7 +152,7 @@ P0 通道处理**严禁**：
 
 | 功能 | 文件 | 说明 |
 |------|------|------|
-| OCR 引擎 trait 重构 | `ocr/mod.rs` | 移除 Python Worker IPC 架构，改为 Rust-native `OcrEngine` trait + `StubOcrEngine` |
+| OCR 引擎 trait | `ocr/mod.rs` | `OcrEngine` trait + `StubOcrEngine` (Phase 2 占位) |
 | 剪贴板文本采集 | `capture/mod.rs` | `ClipboardCapture`: xdotool Ctrl+C → xclip 读取，启动时探测工具可用性 |
 | 剪贴板安全恢复 | `capture/mod.rs` → `ClipboardGuard` | RAII Drop 模式保证 finally 恢复原剪贴板内容 |
 | 语言检测 | `translate/normalize.rs` | whatlang crate，ISO 639-1 映射 |
@@ -171,13 +172,35 @@ P0 通道处理**严禁**：
 | Phase 2 事件体系 | `main.ts` | capture-complete/error, translate-chunk/complete/error |
 | 优雅降级 | `lib.rs` | DEEPSEEK_API_KEY 缺失时跳过翻译服务，仅 warn |
 
-### 未实现（Phase 3-5 计划）
+### 已实现 (Phase 3)
+
+| 功能 | 文件 | 说明 |
+|------|------|------|
+| PythonOcrEngine 实现 | `ocr/python_engine.rs` | 实现 OcrEngine trait，通过 stdin/stdout IPC 与 Python Worker 通信 |
+| MessagePack 帧协议 | `ocr/python_engine.rs` | 4 字节大端长度前缀 + msgpack payload，rmp-serde 编解码 |
+| Worker 进程管理 | `ocr/python_engine.rs` | spawn/restart/shutdown，健康检查(30s ping/pong)，连续 3 次失败自动重启 |
+| OCR 健康检查循环 | `ocr/python_engine.rs` → `start_health_loop` | 专用线程 30s 间隔 ping，500ms 超时 |
+| 屏幕截图采集 | `capture/screen.rs` | ScreenCapture: grim(Wayland)/maim(X11)/scrot(X11) 后端自动检测 |
+| 截图缓存与传输 | `lib.rs` → `screenshot_cache` | parking_lot::Mutex 缓存 PNG bytes，base64 传输到前端 |
+| 区域选择覆盖层 | `capture-overlay.html/ts` | 全屏透明窗口，canvas 绘制，三种选区工具 |
+| 矩形选区 | `capture-overlay.ts` | click-drag 绘制矩形 ROI |
+| 多边形选区 | `capture-overlay.ts` | 点击添加顶点，双击闭合多边形 ROI |
+| 四点透视选区 | `capture-overlay.ts` | 4 次点击定义透视变换角点 |
+| ROI 裁剪 (矩形) | `worker.py` → `ImagePreprocessor` | OpenCV 直接 crop |
+| ROI 裁剪 (多边形) | `worker.py` → `ImagePreprocessor` | fillPoly mask + boundingRect crop |
+| ROI 裁剪 (透视) | `worker.py` → `ImagePreprocessor` | cv2.warpPerspective 透视变换 |
+| OCR 预处理管道 | `worker.py` → `ImagePreprocessor.preprocess` | 灰度 → fastNlMeansDenoising → 自适应阈值 → 可选 deskew |
+| Deskew 校正 | `worker.py` → `ImagePreprocessor._deskew` | minAreaRect 角度检测 + warpAffine 旋转 |
+| P2 Worker 循环 | `scheduler.rs` → `run_p2_loop` | OCR 任务处理：spawn_blocking → OCR → emit ocr-complete → 提交 P1 翻译 |
+| OCR Region 流程编排 | `lib.rs` → `select_mode` | 截屏 → 缓存 → 显示 overlay → 用户选区 → P2 OCR → P1 翻译 |
+| OCR 取消 | `lib.rs` → `cancel_ocr_capture` | Escape 取消选区，隐藏 overlay，清除缓存，回退 Sleep |
+| Phase 3 事件体系 | `main.ts` | ocr-started/ocr-complete/ocr-error 事件监听 |
+| OCR 结果显示 | `result-panel.ts` | 监听 ocr-complete 显示 OCR 原文 |
+
+### 未实现（Phase 4-5 计划）
 
 | 功能 | Phase | 说明 |
 |------|-------|------|
-| Rust-native OCR 引擎实现 | Phase 3 | OcrEngine trait 已就绪，接入轻量引擎 (如 Tesseract FFI) |
-| 区域选择 UI | Phase 3 | 矩形/多边形/四点透视选区 |
-| ROI 预处理 | Phase 3 | 灰度、自适应二值化、降噪、可选 deskew |
 | 翻译缓存 L2 | Phase 5 | SQLite(TTL 7d) |
 | 实时增量翻译 | Phase 4 | 500ms 采样 + 像素差分(MAE/SSIM) 变化检测 |
 | 行级 diff | Phase 4 | line-hash(text + y_bucket 8px)，仅 added lines 进翻译 |
@@ -215,9 +238,11 @@ ciallo/
 │       │   ├── vad.rs             # RMS 能量 VAD + 降频推理
 │       │   └── wake.rs            # WakeDetector trait + 能量模式检测
 │       ├── capture/
-│       │   └── mod.rs             # ClipboardCapture: xdotool+xclip 采集 + ClipboardGuard RAII
+│       │   ├── mod.rs             # ClipboardCapture: xdotool+xclip 采集 + ClipboardGuard RAII
+│       │   └── screen.rs          # ScreenCapture: grim/maim/scrot 后端自动检测
 │       ├── ocr/
-│       │   └── mod.rs             # OcrEngine trait + StubOcrEngine (Phase 3 接入真实引擎)
+│       │   ├── mod.rs             # OcrEngine trait + StubOcrEngine
+│       │   └── python_engine.rs   # PythonOcrEngine: stdin/stdout IPC + msgpack 帧协议
 │       └── translate/
 │           ├── mod.rs             # TranslationService 编排层
 │           ├── normalize.rs       # 语言检测 + 占位符保护/恢复
@@ -228,13 +253,15 @@ ciallo/
 │   ├── index.html                 # 主窗口 HTML
 │   ├── mode-panel.html            # 模式选择面板 HTML
 │   ├── result-panel.html          # 翻译结果悬浮窗 HTML
+│   ├── capture-overlay.html       # 区域选择覆盖层 HTML
 │   ├── main.ts                    # 主窗口逻辑 (事件监听/状态/音效)
 │   ├── mode-panel.ts              # 模式面板逻辑 (invoke 命令)
 │   ├── result-panel.ts            # 结果面板逻辑 (流式渲染/复制)
+│   ├── capture-overlay.ts         # 区域选择覆盖层逻辑 (canvas 选区/提交)
 │   └── style.css                  # 暗色主题样式
-├── python-worker/                 # Python OCR Worker (可选)
-│   ├── worker.py                  # PaddleOCR 进程 (lazy load, msgpack)
-│   ├── requirements.txt           # Python 依赖
+├── python-worker/                 # Python OCR Worker
+│   ├── worker.py                  # PaddleOCR + OpenCV 预处理 (ROI crop/warp, 降噪/二值化/deskew)
+│   ├── requirements.txt           # Python 依赖 (paddleocr, opencv, msgpack, numpy)
 │   └── .venv/                     # Python 虚拟环境
 ├── glossary/
 │   └── default.json               # 术语表
@@ -328,24 +355,77 @@ cancel_latency
 
 纯 TypeScript + CSS，无框架依赖。通过 `window.__TAURI__` 全局对象与后端通信。
 
-**main.ts：** 监听 `wake-detected/confirmed/rejected/force-cancel/play-sound` 事件，驱动状态指示器和音效。
+**main.ts：** 监听 `wake-detected/confirmed/rejected/force-cancel/play-sound` 事件，驱动状态指示器和音效。监听 `ocr-started/ocr-complete/ocr-error` 事件，更新 OCR 状态显示。
 
 **mode-panel.ts：** 三个模式按钮（Selection / OCR Region / Realtime）+ Cancel，通过 `invoke('select_mode', { mode })` 通知后端。
 
-**result-panel.ts：** 翻译结果悬浮窗。监听 `capture-complete`, `translate-chunk`, `translate-complete`, `force-cancel` 事件。流式渲染采用增量 `textContent +=` append，避免全量重排。提供复制译文和关闭按钮。
+**result-panel.ts：** 翻译结果悬浮窗。监听 `capture-complete`, `ocr-complete`, `translate-chunk`, `translate-complete`, `force-cancel` 事件。流式渲染采用增量 `textContent +=` append，避免全量重排。提供复制译文和关闭按钮。
+
+**capture-overlay.ts：** 区域选择覆盖层。加载截图（base64）并绘制到 canvas，提供三种选区工具：矩形（click-drag）、多边形（点击添加顶点，双击闭合）、四点透视（4 次点击）。选区完成后调用 `invoke('submit_ocr_selection')` 提交到 P2 队列。
 
 **style.css：** 暗色主题 (`#1a1a2e`)，脉冲动画反馈，按钮悬停/按下状态。
 
 ### 7. Python OCR Worker (`python-worker/`)
 
-独立进程，当前为 Phase 3 预留。
+Phase 3 完整实现。PaddleOCR + OpenCV 预处理管道，通过 stdin/stdout 与 Rust 主进程通信。
 
 **设计要点：**
 - PaddleOCR 延迟加载，idle ≥ 60s 自动卸载模型释放内存
 - MessagePack 帧协议（4字节大端长度前缀 + msgpack payload），禁止 base64 JSON
 - 支持 ping/pong 健康检查、ocr 任务、shutdown 命令
 
-### 8. 翻译管道 (`translate/`)
+**ImagePreprocessor (Phase 3)：**
+- `crop_roi()` — 三种 ROI 裁剪：矩形直接 crop，多边形 fillPoly mask + boundingRect，透视 warpPerspective
+- `preprocess()` — 灰度 → fastNlMeansDenoising → 自适应阈值(GAUSSIAN, blockSize=11) → 可选 deskew
+- `_deskew()` — minAreaRect 角度检测，±45° 范围内 warpAffine 旋转校正
+
+### 8. PythonOcrEngine (`ocr/python_engine.rs`)
+
+Rust 端的 Python Worker IPC 封装，实现 `OcrEngine` trait。
+
+**关键类型：**
+- `WorkerProcess` — 管理 `Child` 进程 + `BufReader<ChildStdout>` + `ChildStdin`
+- `PythonOcrEngine` — 线程安全封装：`Mutex<Option<WorkerProcess>>` + `AtomicBool` 可用性标志
+- `WorkerMessage` — serde tagged enum：`ping`、`ocr`(image_data + roi)、`shutdown`
+- `WorkerResponse` — 响应枚举：`pong`、`ocr_result`(text + lines + elapsed_ms)、`error`
+
+**IPC 协议：**
+- `send_recv()` — 序列化 msgpack → 4字节 BE 长度前缀 → write stdin → read stdout → 反序列化
+- 自动 spawn worker（首次调用时启动进程）
+- 调用失败时标记 `available = false`，健康检查恢复后重新标记
+
+**健康检查循环：**
+- `start_health_loop()` 启动专用线程，30s 间隔发送 ping
+- 连续 3 次失败 → 重启 worker 进程
+- 成功响应 → 重置失败计数
+
+### 9. 屏幕截图采集 (`capture/screen.rs`)
+
+支持多种 Linux 截图工具的屏幕截图采集器。
+
+**ScreenCapture：**
+- 启动时 `probe_backends()` 按优先级探测可用后端：grim(Wayland) > maim(X11) > scrot(X11)
+- `capture()` — 调用选中后端执行截图 → 保存 `/tmp/ciallo_capture.png` → 读取字节
+- `is_available()` — 至少有一个后端可用即返回 true
+
+### 10. 区域选择覆盖层 (`capture-overlay.html/ts`)
+
+全屏透明 Tauri 窗口，用于 OCR Region 模式的区域选择。
+
+**工作流：**
+1. 用户选择 OCR Region 模式 → 后端截屏并缓存 → 显示 overlay 窗口
+2. Overlay 通过 `invoke('get_screenshot_base64')` 获取截图并绘制到 canvas
+3. 用户使用工具选区（矩形/多边形/四点透视）
+4. 选区完成 → `invoke('submit_ocr_selection', { roiType, roiParams })` → 隐藏 overlay
+5. P2 队列接收 OCR 任务 → Python Worker 执行 → 结果送 P1 翻译
+
+**工具：**
+- **矩形**：click-drag 绘制，实时预览矩形框
+- **多边形**：点击添加顶点，双击闭合多边形
+- **四点透视**：依次点击 4 个角点，适用于倾斜/透视文档
+- Escape/Cancel 取消并回退到 Sleep 状态
+
+### 11. 翻译管道 (`translate/`)
 
 Phase 2 完整翻译管道，由 `TranslationService` 编排。
 
@@ -379,7 +459,7 @@ Phase 2 完整翻译管道，由 `TranslationService` 编排。
 5. restore placeholders
 6. cache insert
 
-### 9. 文本采集 (`capture/`)
+### 12. 文本采集 (`capture/`)
 
 **ClipboardCapture：**
 - 启动时 `probe_command()` 检测 xdotool + xclip 可用性
@@ -396,7 +476,7 @@ Phase 2 完整翻译管道，由 `TranslationService` 编排。
 | 唤醒反馈 (Wake→UI) | p95 < 250ms, p99 < 400ms | 框架就绪，埋点已实现 |
 | 模式面板出现 | p95 < 300ms, p99 < 500ms | 预创建 hidden + show，埋点就绪 |
 | 选中翻译首条译文 | p95 < 800ms, p99 < 1.2s | Phase 2 链路完成，待实测 |
-| OCR 翻译首条译文 | p95 < 1.2s, p99 < 2.0s | Phase 3 (OcrEngine trait 就绪) |
+| OCR 翻译首条译文 | p95 < 1.2s, p99 < 2.0s | Phase 3 链路完成，待实测 |
 | 高优任务排队等待 | p95 < 80ms, p99 < 120ms | crossbeam 无界 + 专用线程 |
 | 待机 CPU | < 2% | 预期达标 (sleep loop) |
 | 待机内存 | < 200MB | 预期达标 (~96KB ring buffer) |
@@ -435,11 +515,11 @@ sudo apt-get install -y nodejs
 cd /path/to/ciallo
 npm install
 
-# 5. Python 虚拟环境 (可选，OCR 用)
+# 5. Python 虚拟环境 (OCR Worker)
 cd python-worker
 python3 -m venv .venv
 source .venv/bin/activate
-pip install msgpack  # Phase 1 仅需 msgpack
+pip install -r requirements.txt  # paddleocr, opencv-python-headless, msgpack, numpy
 ```
 
 或直接运行：
@@ -531,9 +611,43 @@ cargo run
 - `src-tauri/src/scheduler.rs` — P1 worker loop + Mutex 重构
 - `src-tauri/src/lib.rs` — AppContext 扩展 + 翻译服务初始化
 
-### Phase 3: Rust-native OCR + 区域翻译 [计划中]
+### Phase 3: OCR Worker + ROI 预处理 + 区域翻译 [已完成]
 
-**目标：** 接入轻量 Rust OCR 引擎实现 `OcrEngine` trait，实现区域选择 → 预处理 → OCR → 翻译链路。
+**目标：** 实现 Python OCR Worker IPC、ROI 预处理管道、区域选择 UI、OCR→翻译完整链路。
+
+**完成内容：**
+1. `PythonOcrEngine` 实现 `OcrEngine` trait，通过 stdin/stdout + MessagePack 帧协议与 Python Worker 通信
+2. Worker 进程生命周期管理：自动 spawn、健康检查(30s ping/pong)、连续 3 次失败自动重启
+3. Python Worker 升级：`ImagePreprocessor` 类，支持矩形/多边形/透视 ROI 裁剪 + 灰度/降噪/自适应阈值/deskew 预处理
+4. `ScreenCapture` 屏幕截图采集器：grim(Wayland)/maim(X11)/scrot(X11) 后端自动检测
+5. 区域选择覆盖层 (`capture-overlay`)：全屏透明窗口，canvas 绘制，三种选区工具（矩形/多边形/四点透视）
+6. 截图缓存与 base64 传输：后端缓存 PNG bytes → 前端通过 Tauri command 获取
+7. `run_p2_loop()` P2 Worker 循环：spawn_blocking OCR → emit ocr-complete → 提交 P1 翻译
+8. OCR Region 流程编排：select_mode → 截屏 → 缓存 → overlay → 选区 → P2 OCR → P1 翻译
+9. 前端 OCR 事件体系：ocr-started/ocr-complete/ocr-error 状态更新
+10. Tauri 配置：capture-overlay 窗口(fullscreen + transparent + alwaysOnTop)，CSP 允许 data: 图片
+
+**编译状态：** `cargo check` 通过 (零错误零警告)，`npm run build` 通过
+
+**新增文件：**
+- `src-tauri/src/ocr/python_engine.rs` — PythonOcrEngine IPC 实现
+- `src-tauri/src/capture/screen.rs` — ScreenCapture 屏幕截图采集
+- `src/capture-overlay.html` — 区域选择覆盖层 HTML
+- `src/capture-overlay.ts` — 区域选择覆盖层前端逻辑
+
+**修改文件：**
+- `src-tauri/Cargo.toml` — 新增 rmp-serde, base64 依赖
+- `src-tauri/src/ocr/mod.rs` — 添加 python_engine 模块导出
+- `src-tauri/src/capture/mod.rs` — 添加 screen 模块导出
+- `src-tauri/src/scheduler.rs` — 新增 `run_p2_loop()` P2 Worker 循环
+- `src-tauri/src/lib.rs` — OCR engine 初始化、P2 loop 启动、新增 get_screenshot_base64/submit_ocr_selection/cancel_ocr_capture 命令
+- `src-tauri/tauri.conf.json` — 添加 capture-overlay 窗口配置，更新 CSP
+- `src-tauri/capabilities/default.json` — 添加 capture-overlay 到 windows 列表
+- `src/main.ts` — 添加 ocr-started/ocr-complete/ocr-error 事件监听
+- `src/result-panel.ts` — 添加 ocr-complete 事件监听显示 OCR 原文
+- `src/style.css` — 添加 capture overlay 样式
+- `build.mjs` — 添加 capture-overlay.ts 构建和 HTML 拷贝
+- `python-worker/worker.py` — 全面升级：ImagePreprocessor 类 + ROI 裁剪 + 预处理管道
 
 ### Phase 4: 实时增量翻译 [计划中]
 
@@ -549,7 +663,7 @@ cargo run
 
 ### 已实现
 
-- [x] Tauri v2 项目骨架 + 三窗口 (main + mode-panel + result-panel)
+- [x] Tauri v2 项目骨架 + 四窗口 (main + mode-panel + result-panel + capture-overlay)
 - [x] 状态机 (8 状态，验证转移)
 - [x] 两阶段唤醒确认 (th_low → UI反馈 → th_high 确认/回退)
 - [x] 三队列调度器 (P0 crossbeam unbounded / P1 tokio mpsc / P2 tokio mpsc)
@@ -567,10 +681,10 @@ cargo run
 - [x] trace_id / request_id / generation 追踪
 - [x] Tauri 命令 (get_state / get_metrics_summary / select_mode / cancel_current / dismiss)
 - [x] TextCapture trait + ClipboardCapture 实现
-- [x] OcrEngine trait + StubOcrEngine (Phase 3 接入真实引擎)
+- [x] OcrEngine trait + StubOcrEngine + PythonOcrEngine (Python Worker IPC)
 - [x] ROI 类型定义 (Rect / Polygon / Perspective)
 - [x] OCR 预处理配置类型 (grayscale, threshold, denoise, deskew)
-- [x] Python OCR Worker (PaddleOCR, lazy load, idle 卸载, msgpack)
+- [x] Python OCR Worker (PaddleOCR, lazy load, idle 卸载, msgpack, ROI 预处理)
 - [x] 术语表 JSON 模板 + 匹配注入
 - [x] 开发脚本 (scripts/dev.sh)
 - [x] .gitignore
@@ -592,13 +706,23 @@ cargo run
 - [x] Phase 2 事件体系 (capture/translate 事件)
 - [x] DEEPSEEK_API_KEY 优雅降级
 - [x] API Key 安全处理 (仅环境变量，日志不泄露)
+- [x] PythonOcrEngine (stdin/stdout IPC + msgpack 帧协议)
+- [x] Worker 进程生命周期管理 (spawn/restart/健康检查)
+- [x] 屏幕截图采集 (ScreenCapture: grim/maim/scrot 后端检测)
+- [x] 区域选择覆盖层 (capture-overlay: 全屏透明 canvas)
+- [x] 矩形选区 (click-drag)
+- [x] 多边形选区 (点击添加顶点，双击闭合)
+- [x] 四点透视选区 (4 次点击定义角点)
+- [x] ROI 裁剪 (矩形 crop / 多边形 mask+crop / 透视 warpPerspective)
+- [x] OCR 预处理管道 (灰度 → 降噪 → 自适应阈值 → deskew)
+- [x] P2 Worker 循环 (run_p2_loop: OCR → emit → P1 翻译)
+- [x] OCR Region 完整流程 (截屏 → 缓存 → overlay → 选区 → P2 OCR → P1 翻译)
+- [x] Phase 3 事件体系 (ocr-started/ocr-complete/ocr-error)
+- [x] OCR 结果显示 (result-panel 监听 ocr-complete)
 
 ### 未实现
 
 - [ ] 真实唤醒词模型 (当前用能量尖峰检测代替)
-- [ ] Rust-native OCR 引擎实现 (OcrEngine trait 已就绪)
-- [ ] 区域选择 UI (矩形/多边形/四点透视)
-- [ ] ROI 预处理 (灰度、二值化、降噪、deskew)
 - [ ] 翻译缓存 L2 (SQLite, TTL 7d)
 - [ ] 实时增量翻译
 - [ ] 像素差分变化检测 (MAE/SSIM)
@@ -638,6 +762,15 @@ cargo run
         "alwaysOnTop": true,
         "width": 480,
         "height": 320
+      },
+      {
+        "label": "capture-overlay",
+        "visible": false,
+        "fullscreen": true,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "resizable": false
       }
     ]
   }
@@ -679,12 +812,19 @@ cargo run
 | TextCapture/OcrEngine 用 trait | 平台适配器模式，隔离平台代码 |
 | 音效用 WebAudio 合成 | 无需外部音频文件，零额外依赖 |
 | metrics 用自实现 SampleRing | 无需引入 prometheus/metrics 等重依赖 |
-| OCR 从 Python Worker 改为 Rust-native trait | 消除 IPC 开销，减少资源占用，简化部署 |
 | 手动 SSE 解析而非 eventsource-stream crate | 减少依赖，对 DeepSeek 响应格式更可控 |
 | 40ms batched chunk flush | 平衡渲染频率与性能，避免逐 token DOM 更新 |
 | blake3 而非 sha256 做缓存 key | 更快的哈希，无密码学需求 |
 | on_chunk callback 用 `&(dyn Fn + Send + Sync)` | tokio::spawn 要求 future 为 Send |
 | ClipboardGuard RAII Drop | 保证剪贴板恢复，即使发生 panic |
+| Python Worker IPC (stdin/stdout) | 跨平台兼容，无需 Named Pipe/Unix Socket 差异处理 |
+| rmp-serde 做 IPC 序列化 | 与 Python msgpack 互操作，二进制紧凑 |
+| base64 传输截图到前端 | Tauri command 不支持直接传 binary，base64 是最简方案 |
+| ScreenCapture 后端探测链 | grim > maim > scrot 优先级，覆盖 Wayland 和 X11 |
+| Canvas 绘制选区而非 DOM | 性能好，支持自由绘制多边形和实时预览 |
+| 截图缓存在 Mutex 中 | 单次使用(take)，OCR 提交后立即释放内存 |
+| P2 用 spawn_blocking | OCR 是 CPU 密集型，不阻塞 Tokio 异步运行时 |
+| OCR 结果直接提交 P1 翻译 | P2→P1 自动衔接，用户无需二次操作 |
 
 ---
 

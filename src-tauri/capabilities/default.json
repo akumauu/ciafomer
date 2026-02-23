@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Default capabilities for ciallo",
-  "windows": ["main", "mode-panel", "result-panel"],
+  "windows": ["main", "mode-panel", "result-panel", "capture-overlay"],
   "permissions": [
     "core:default",
     "core:event:default",

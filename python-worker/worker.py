@@ -1,8 +1,10 @@
 """
-Ciallo OCR Worker (optional, Phase 3+).
-Standalone Python process communicating via Named Pipe (Win) / Unix Socket.
-Protocol: MessagePack + raw bytes (no base64 JSON).
+Ciallo OCR Worker — Phase 3.
+Standalone Python process communicating via stdin/stdout.
+Protocol: MessagePack framed (4-byte BE length prefix + msgpack payload).
 Model: PaddleOCR + OpenCV, lazy-loaded, idle>=60s auto-unload.
+Features: ROI crop (rect/polygon/perspective), preprocessing (grayscale,
+adaptive threshold, denoise, deskew).
 """
 
 import sys
@@ -21,10 +23,10 @@ log = logging.getLogger("ocr-worker")
 # Lazy-loaded modules (only import when needed)
 _paddle_ocr = None
 _cv2 = None
+_np = None
 _msgpack = None
 
 MODEL_IDLE_TIMEOUT = 60  # seconds before unloading model
-HEALTH_CHECK_INTERVAL = 30
 
 
 def _ensure_msgpack():
@@ -33,6 +35,181 @@ def _ensure_msgpack():
         import msgpack
         _msgpack = msgpack
     return _msgpack
+
+
+def _ensure_cv2():
+    global _cv2
+    if _cv2 is None:
+        import cv2
+        _cv2 = cv2
+    return _cv2
+
+
+def _ensure_np():
+    global _np
+    if _np is None:
+        import numpy as np
+        _np = np
+    return _np
+
+
+class ImagePreprocessor:
+    """ROI extraction and image preprocessing for OCR."""
+
+    @staticmethod
+    def decode_image(image_bytes):
+        """Decode raw image bytes (PNG/JPEG) to numpy array."""
+        np = _ensure_np()
+        cv2 = _ensure_cv2()
+        arr = np.frombuffer(image_bytes, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None:
+            raise ValueError("Failed to decode image")
+        return img
+
+    @staticmethod
+    def crop_roi(img, roi_type, roi_params):
+        """Crop image to region of interest.
+
+        Supports:
+        - rect: {x, y, w, h}
+        - polygon: {points: [[x1,y1], [x2,y2], ...]}
+        - perspective: {corners: [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]}
+        - fullframe: no cropping
+        """
+        np = _ensure_np()
+        cv2 = _ensure_cv2()
+
+        if roi_type == "rect":
+            x = int(roi_params.get("x", 0))
+            y = int(roi_params.get("y", 0))
+            w = int(roi_params.get("w", img.shape[1]))
+            h = int(roi_params.get("h", img.shape[0]))
+            # Clamp to image bounds
+            x = max(0, min(x, img.shape[1] - 1))
+            y = max(0, min(y, img.shape[0] - 1))
+            w = min(w, img.shape[1] - x)
+            h = min(h, img.shape[0] - y)
+            return img[y:y+h, x:x+w].copy()
+
+        elif roi_type == "polygon":
+            points = roi_params.get("points", [])
+            if len(points) < 3:
+                return img
+            pts = np.array(points, dtype=np.int32)
+            # Create mask
+            mask = np.zeros(img.shape[:2], dtype=np.uint8)
+            cv2.fillPoly(mask, [pts], 255)
+            # Apply mask
+            result = cv2.bitwise_and(img, img, mask=mask)
+            # Crop to bounding rect of polygon
+            x, y, w, h = cv2.boundingRect(pts)
+            return result[y:y+h, x:x+w].copy()
+
+        elif roi_type == "perspective":
+            corners = roi_params.get("corners", [])
+            if len(corners) != 4:
+                return img
+            src_pts = np.array(corners, dtype=np.float32)
+            # Compute target rect size from perspective corners
+            w1 = np.linalg.norm(src_pts[0] - src_pts[1])
+            w2 = np.linalg.norm(src_pts[2] - src_pts[3])
+            h1 = np.linalg.norm(src_pts[0] - src_pts[3])
+            h2 = np.linalg.norm(src_pts[1] - src_pts[2])
+            width = int(max(w1, w2))
+            height = int(max(h1, h2))
+            if width < 1 or height < 1:
+                return img
+            dst_pts = np.array([
+                [0, 0],
+                [width - 1, 0],
+                [width - 1, height - 1],
+                [0, height - 1]
+            ], dtype=np.float32)
+            M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+            return cv2.warpPerspective(img, M, (width, height))
+
+        else:
+            # fullframe or unknown — return as-is
+            return img
+
+    @staticmethod
+    def preprocess(img, config):
+        """Apply preprocessing pipeline.
+
+        config keys: grayscale, adaptive_threshold, denoise, deskew
+        """
+        np = _ensure_np()
+        cv2 = _ensure_cv2()
+        result = img.copy()
+
+        if config.get("grayscale", True):
+            if len(result.shape) == 3:
+                result = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
+
+        if config.get("denoise", True):
+            if len(result.shape) == 2:
+                result = cv2.fastNlMeansDenoising(result, h=10)
+            else:
+                result = cv2.fastNlMeansDenoisingColored(result, h=10)
+
+        if config.get("adaptive_threshold", True):
+            if len(result.shape) == 2:
+                result = cv2.adaptiveThreshold(
+                    result, 255,
+                    cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                    cv2.THRESH_BINARY,
+                    blockSize=11,
+                    C=2
+                )
+
+        if config.get("deskew", False):
+            result = ImagePreprocessor._deskew(result)
+
+        # PaddleOCR expects BGR 3-channel, convert back if needed
+        if len(result.shape) == 2:
+            result = cv2.cvtColor(result, cv2.COLOR_GRAY2BGR)
+
+        return result
+
+    @staticmethod
+    def _deskew(img):
+        """Correct text skew using minimum area rectangle."""
+        np = _ensure_np()
+        cv2 = _ensure_cv2()
+
+        # Work on a binary version for angle detection
+        if len(img.shape) == 3:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = img.copy()
+
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+
+        coords = np.column_stack(np.where(binary > 0))
+        if len(coords) < 10:
+            return img
+
+        angle = cv2.minAreaRect(coords)[-1]
+
+        if angle < -45:
+            angle = -(90 + angle)
+        else:
+            angle = -angle
+
+        if abs(angle) < 0.5:
+            return img
+
+        h, w = img.shape[:2]
+        center = (w // 2, h // 2)
+        M = cv2.getRotationMatrix2D(center, angle, 1.0)
+        rotated = cv2.warpAffine(
+            img, M, (w, h),
+            flags=cv2.INTER_CUBIC,
+            borderMode=cv2.BORDER_REPLICATE
+        )
+        log.info(f"Deskew: rotated by {angle:.1f} degrees")
+        return rotated
 
 
 class OcrEngine:
@@ -66,20 +243,11 @@ class OcrEngine:
                     log.info(f"Unloading model after {idle:.0f}s idle.")
                     self._model = None
 
-    def run_ocr(self, image_bytes: bytes) -> list:
-        """Run OCR on raw image bytes. Returns list of (text, confidence, bbox)."""
-        global _cv2
-        if _cv2 is None:
-            import cv2
-            _cv2 = cv2
-        import numpy as np
-
+    def run_ocr(self, img):
+        """Run OCR on a preprocessed image (numpy array, BGR).
+        Returns list of {text, confidence, bbox, y_center}."""
         with self._lock:
             self._ensure_model()
-            arr = np.frombuffer(image_bytes, dtype=np.uint8)
-            img = _cv2.imdecode(arr, _cv2.IMREAD_COLOR)
-            if img is None:
-                return []
             result = self._model.ocr(img, cls=True)
             lines = []
             if result and result[0]:
@@ -106,27 +274,64 @@ class WorkerServer:
 
     def __init__(self):
         self.engine = OcrEngine()
+        self.preprocessor = ImagePreprocessor()
         self._running = True
 
-    def handle_message(self, msg: dict) -> dict:
+    def handle_message(self, msg):
         msg_type = msg.get("type", "")
+
         if msg_type == "ping":
             return {"type": "pong"}
+
         elif msg_type == "ocr":
             request_id = msg.get("request_id", "")
             image_data = msg.get("image_data", b"")
-            t0 = time.monotonic()
-            lines = self.engine.run_ocr(image_data)
-            elapsed_ms = (time.monotonic() - t0) * 1000
-            return {
-                "type": "ocr_result",
-                "request_id": request_id,
-                "lines": lines,
-                "elapsed_ms": elapsed_ms,
-            }
+            roi_type = msg.get("roi_type", "fullframe")
+            roi_params = msg.get("roi_params", {})
+            preprocess_config = msg.get("preprocess", {})
+
+            try:
+                t0 = time.monotonic()
+
+                # 1. Decode image
+                img = self.preprocessor.decode_image(image_data)
+                log.info(f"Decoded image: {img.shape[1]}x{img.shape[0]}")
+
+                # 2. Crop ROI (must be ROI-only, not full frame for OCR)
+                roi_img = self.preprocessor.crop_roi(img, roi_type, roi_params)
+                log.info(f"ROI cropped ({roi_type}): {roi_img.shape[1]}x{roi_img.shape[0]}")
+
+                # 3. Preprocess
+                processed = self.preprocessor.preprocess(roi_img, preprocess_config)
+
+                # 4. Run OCR on ROI only
+                lines = self.engine.run_ocr(processed)
+
+                elapsed_ms = (time.monotonic() - t0) * 1000
+                log.info(
+                    f"OCR done: {len(lines)} lines in {elapsed_ms:.1f}ms "
+                    f"(request_id={request_id})"
+                )
+
+                return {
+                    "type": "ocr_result",
+                    "request_id": request_id,
+                    "lines": lines,
+                    "elapsed_ms": elapsed_ms,
+                }
+
+            except Exception as e:
+                log.exception(f"OCR processing error: {e}")
+                return {
+                    "type": "error",
+                    "request_id": request_id,
+                    "message": str(e),
+                }
+
         elif msg_type == "shutdown":
             self._running = False
             return {"type": "ack"}
+
         else:
             return {"type": "error", "message": f"unknown type: {msg_type}"}
 

@@ -26,6 +26,10 @@ blake3 = "1"
 whatlang = "0.16"
 regex = "1"
 
+# Phase 3: OCR Python worker IPC
+rmp-serde = "1"
+base64 = "0.22"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

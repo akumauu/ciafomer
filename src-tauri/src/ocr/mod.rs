@@ -1,8 +1,12 @@
-//! OCR module — Rust-native engine interface.
-//! Phase 2: trait redesign (removed Python worker IPC architecture).
-//! Phase 3: full implementation with a Rust-native OCR engine.
+//! OCR module — engine interface and Python worker IPC.
+//! Phase 2: trait redesign.
+//! Phase 3: PythonOcrEngine implementation (PaddleOCR + OpenCV via IPC).
+
+pub mod python_engine;
 
 use serde::{Serialize, Deserialize};
+
+pub use python_engine::PythonOcrEngine;
 
 /// OCR request.
 #[derive(Debug, Clone, Serialize)]

@@ -13,6 +13,7 @@ use tracing::{info, warn, error};
 use crate::cancellation::CancelCoordinator;
 use crate::capture::TextCapture;
 use crate::metrics::{MetricsRegistry, metric_names};
+use crate::ocr::OcrEngine;
 use crate::state_machine::{AppState, StateMachine};
 use crate::translate::TranslationService;
 
@@ -490,5 +491,172 @@ pub fn run_p1_loop(
         }
 
         info!("P1 worker loop exiting");
+    });
+}
+
+/// P2 worker loop: processes OCR tasks. Heavy OCR runs via spawn_blocking.
+/// On OCR completion, submits the extracted text to P1 for translation.
+pub fn run_p2_loop(
+    scheduler: Arc<Scheduler>,
+    state_machine: Arc<StateMachine>,
+    cancel: Arc<CancelCoordinator>,
+    metrics: Arc<MetricsRegistry>,
+    ocr_engine: Arc<dyn OcrEngine>,
+    _translation_service: Arc<TranslationService>,
+    _capture: Arc<dyn TextCapture>,
+    app_handle: tauri::AppHandle,
+) {
+    let mut rx = scheduler
+        .take_p2_receiver()
+        .expect("P2 receiver already taken");
+
+    let p1_tx = scheduler.p1_sender();
+
+    tokio::spawn(async move {
+        info!("P2 worker loop started");
+
+        while let Some(task) = rx.recv().await {
+            match task {
+                P2Task::OcrRegion {
+                    request_id,
+                    generation,
+                    image_data,
+                    roi,
+                    enqueued_at,
+                } => {
+                    let wait_us = enqueued_at.elapsed().as_micros() as f64;
+                    metrics.record(metric_names::QUEUE_WAIT_P2, wait_us);
+
+                    let guard = cancel.p2_guard();
+                    if !guard.should_continue() {
+                        continue;
+                    }
+
+                    // Transition to OCR state
+                    let _ = state_machine.transition(AppState::Ocr);
+
+                    {
+                        use tauri::Emitter;
+                        let _ = app_handle.emit("ocr-started", serde_json::json!({
+                            "request_id": &request_id,
+                        }));
+                    }
+
+                    // Build OcrRequest
+                    let (roi_type, roi_params) = match roi {
+                        OcrRoi::Rect { x, y, w, h } => (
+                            crate::ocr::RoiType::Rect,
+                            crate::ocr::RoiParams::Rect { x, y, w, h },
+                        ),
+                        OcrRoi::Polygon { points } => (
+                            crate::ocr::RoiType::Polygon,
+                            crate::ocr::RoiParams::Polygon { points },
+                        ),
+                        OcrRoi::Perspective { corners } => (
+                            crate::ocr::RoiType::Perspective,
+                            crate::ocr::RoiParams::Perspective { corners },
+                        ),
+                    };
+
+                    let ocr_request = crate::ocr::OcrRequest {
+                        request_id: request_id.clone(),
+                        generation,
+                        image_data,
+                        roi_type,
+                        roi_params,
+                        preprocess: crate::ocr::PreprocessConfig::default(),
+                    };
+
+                    let ocr_start = Instant::now();
+                    let engine = Arc::clone(&ocr_engine);
+                    let ocr_result = tokio::task::spawn_blocking(move || {
+                        engine.recognize(ocr_request)
+                    })
+                    .await;
+
+                    if !guard.should_continue() {
+                        continue;
+                    }
+
+                    match ocr_result {
+                        Ok(Ok(result)) => {
+                            let ocr_us = ocr_start.elapsed().as_micros() as f64;
+                            metrics.record(metric_names::OCR_DONE, ocr_us);
+
+                            // Combine OCR lines into a single text
+                            let ocr_text: String = result
+                                .lines
+                                .iter()
+                                .map(|l| l.text.as_str())
+                                .collect::<Vec<&str>>()
+                                .join("\n");
+
+                            if ocr_text.trim().is_empty() {
+                                warn!("OCR produced no text");
+                                use tauri::Emitter;
+                                let _ = app_handle.emit(
+                                    "ocr-error",
+                                    serde_json::json!({ "error": "OCR produced no text" }),
+                                );
+                                state_machine.force_sleep();
+                                continue;
+                            }
+
+                            info!(
+                                lines = result.lines.len(),
+                                text_len = ocr_text.len(),
+                                elapsed_ms = result.elapsed_ms,
+                                "ocr_complete"
+                            );
+
+                            {
+                                use tauri::Emitter;
+                                let _ = app_handle.emit(
+                                    "ocr-complete",
+                                    serde_json::json!({
+                                        "request_id": &request_id,
+                                        "text": &ocr_text,
+                                        "lines": result.lines.len(),
+                                        "elapsed_ms": result.elapsed_ms,
+                                    }),
+                                );
+                            }
+
+                            // Submit OCR text to P1 for translation
+                            let _ = state_machine.transition(AppState::Translate);
+                            let _ = p1_tx
+                                .send(P1Task::Translate {
+                                    request_id,
+                                    generation,
+                                    text: ocr_text,
+                                    target_lang: "zh".to_string(),
+                                    enqueued_at: Instant::now(),
+                                })
+                                .await;
+                        }
+                        Ok(Err(e)) => {
+                            warn!(error = %e, "OCR failed");
+                            use tauri::Emitter;
+                            let _ = app_handle.emit(
+                                "ocr-error",
+                                serde_json::json!({ "error": e.to_string() }),
+                            );
+                            state_machine.force_sleep();
+                        }
+                        Err(e) => {
+                            error!(error = %e, "OCR task panicked");
+                            use tauri::Emitter;
+                            let _ = app_handle.emit(
+                                "ocr-error",
+                                serde_json::json!({ "error": "OCR worker crashed, restarting..." }),
+                            );
+                            state_machine.force_sleep();
+                        }
+                    }
+                }
+            }
+        }
+
+        info!("P2 worker loop exiting");
     });
 }

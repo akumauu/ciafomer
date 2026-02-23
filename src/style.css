@@ -235,3 +235,98 @@ body {
 .action-btn:hover {
   background: var(--accent);
 }
+
+/* Capture overlay window */
+.capture-overlay-body {
+  background: transparent;
+  cursor: crosshair;
+  overflow: hidden;
+}
+
+#capture-canvas {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  z-index: 1;
+}
+
+#capture-toolbar {
+  position: fixed;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10;
+  display: flex;
+  gap: 4px;
+  padding: 6px 10px;
+  background: var(--surface);
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+}
+
+.capture-tool-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 12px;
+  transition: background 0.15s, color 0.15s;
+}
+
+.capture-tool-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text);
+}
+
+.capture-tool-btn.active {
+  background: var(--accent);
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.cancel-tool-btn {
+  color: var(--text-dim);
+}
+
+.cancel-tool-btn:hover {
+  background: rgba(233, 69, 96, 0.3);
+  color: var(--accent);
+}
+
+.tool-icon {
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 11px;
+}
+
+.toolbar-divider {
+  width: 1px;
+  background: rgba(255, 255, 255, 0.1);
+  margin: 0 4px;
+}
+
+#capture-hint {
+  position: fixed;
+  bottom: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10;
+  padding: 8px 16px;
+  background: rgba(22, 33, 62, 0.85);
+  border-radius: 8px;
+  font-size: 12px;
+  color: var(--text-dim);
+  pointer-events: none;
+}

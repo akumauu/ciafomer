@@ -30,6 +30,13 @@ listen('capture-complete', (event: { payload: unknown }) => {
   translatedText.textContent = ''; // Clear previous translation
 }).catch((e) => console.error('listen capture-complete failed:', e));
 
+// Phase 3: OCR complete — display OCR text as source, clear translation
+listen('ocr-complete', (event: { payload: unknown }) => {
+  const data = event.payload as { text: string };
+  sourceText.textContent = data.text;
+  translatedText.textContent = ''; // Clear previous translation
+}).catch((e) => console.error('listen ocr-complete failed:', e));
+
 // Streaming: append chunks incrementally (no full re-render)
 listen('translate-chunk', (event: { payload: unknown }) => {
   const chunk = event.payload as string;

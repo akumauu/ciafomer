@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Capture Overlay</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body class="capture-overlay-body">
+  <canvas id="capture-canvas"></canvas>
+  <div id="capture-toolbar">
+    <button class="capture-tool-btn active" data-tool="rect">
+      <span class="tool-icon">R</span>
+      <span class="tool-label">Rect</span>
+    </button>
+    <button class="capture-tool-btn" data-tool="polygon">
+      <span class="tool-icon">P</span>
+      <span class="tool-label">Polygon</span>
+    </button>
+    <button class="capture-tool-btn" data-tool="perspective">
+      <span class="tool-icon">4</span>
+      <span class="tool-label">4-Point</span>
+    </button>
+    <div class="toolbar-divider"></div>
+    <button class="capture-tool-btn cancel-tool-btn" id="btn-cancel-capture">
+      <span class="tool-label">Cancel</span>
+    </button>
+  </div>
+  <div id="capture-hint">Click and drag to select region. Press Esc to cancel.</div>
+  <script src="capture-overlay.js"></script>
+</body>
+</html>

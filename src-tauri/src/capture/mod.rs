@@ -2,6 +2,8 @@
 //! Uses xdotool to simulate Ctrl+C and xclip to read/restore clipboard.
 //! Startup capability detection: probes for xdotool/xclip availability once.
 
+pub mod screen;
+
 use std::process::Command;
 use std::time::Duration;
 

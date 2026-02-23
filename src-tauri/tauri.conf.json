@@ -54,10 +54,21 @@
         "center": true,
         "resizable": true,
         "url": "result-panel.html"
+      },
+      {
+        "label": "capture-overlay",
+        "title": "",
+        "visible": false,
+        "fullscreen": true,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "resizable": false,
+        "url": "capture-overlay.html"
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'"
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:"
     }
   }
 }
