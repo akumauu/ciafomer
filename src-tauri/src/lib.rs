@@ -10,6 +10,7 @@ pub mod capture;
 pub mod ocr;
 pub mod translate;
 pub mod realtime;
+pub mod history;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,12 +24,14 @@ use scheduler::{Scheduler, P1Task, P2Task, OcrRoi};
 use cancellation::CancelCoordinator;
 use metrics::{MetricsRegistry, MetricSummary};
 use translate::cache::TranslationCache;
+use translate::sqlite_cache::SqliteCache;
 use translate::glossary::Glossary;
 use translate::deepseek::DeepSeekClient;
 use translate::TranslationService;
 use capture::{TextCapture, ClipboardCapture};
 use capture::screen::ScreenCapture;
 use ocr::{OcrEngine, PythonOcrEngine};
+use history::{HistoryStore, HistoryRecord};
 
 /// Shared application state managed by Tauri.
 pub struct AppContext {
@@ -47,6 +50,8 @@ pub struct AppContext {
     pub screenshot_cache: parking_lot::Mutex<Option<Vec<u8>>>,
     /// Phase 4: Cancellation token for the realtime incremental loop.
     pub realtime_cancel: parking_lot::Mutex<Option<CancellationToken>>,
+    /// Phase 5: History store (async batch writer to SQLite).
+    pub history_store: Option<Arc<HistoryStore>>,
 }
 
 // --- Tauri Commands ---
@@ -213,6 +218,7 @@ fn submit_ocr_selection(
         let screen_capture = Arc::clone(&ctx.screen_capture);
         let metrics = Arc::clone(&ctx.metrics);
         let state_machine = Arc::clone(&ctx.state_machine);
+        let history = ctx.history_store.clone();
         let handle = app.clone();
 
         tokio::spawn(realtime::run_realtime_loop(
@@ -225,6 +231,7 @@ fn submit_ocr_selection(
             handle,
             metrics,
             state_machine,
+            history,
         ));
 
         info!(roi_type = %roi_type, "realtime loop started");
@@ -355,6 +362,18 @@ fn dismiss(ctx: tauri::State<'_, AppContext>, app: tauri::AppHandle) {
     }
 }
 
+/// Phase 5: Query recent translation history.
+#[tauri::command]
+fn get_history(
+    ctx: tauri::State<'_, AppContext>,
+    limit: Option<usize>,
+) -> Vec<HistoryRecord> {
+    match &ctx.history_store {
+        Some(store) => store.query_recent(limit.unwrap_or(50)),
+        None => Vec::new(),
+    }
+}
+
 /// Build and run the Tauri application.
 pub fn run() {
     // Initialize tracing
@@ -386,6 +405,39 @@ pub fn run() {
     // Create translation cache (512 entries, 10min TTL)
     let cache = Arc::new(TranslationCache::new(512, Duration::from_secs(600)));
 
+    // Phase 5: Create L2 SQLite translation cache (TTL 7d)
+    let data_dir = dirs_data_path();
+    let l2_cache: Option<Arc<SqliteCache>> = {
+        let db_path = data_dir.join("translation_cache.db");
+        match SqliteCache::open(&db_path) {
+            Ok(c) => {
+                let arc = Arc::new(c);
+                SqliteCache::start_cleanup_loop(Arc::clone(&arc));
+                info!("L2 SQLite cache initialized");
+                Some(arc)
+            }
+            Err(e) => {
+                warn!(error = %e, "L2 SQLite cache init failed, running without persistent cache");
+                None
+            }
+        }
+    };
+
+    // Phase 5: Create history store (async batch writer, 300ms flush)
+    let history_store: Option<Arc<HistoryStore>> = {
+        let db_path = data_dir.join("history.db");
+        match HistoryStore::open(&db_path) {
+            Ok(store) => {
+                info!("history store initialized");
+                Some(store)
+            }
+            Err(e) => {
+                warn!(error = %e, "history store init failed, running without history");
+                None
+            }
+        }
+    };
+
     // Create DeepSeek client and translation service
     let translation_service = match DeepSeekClient::new() {
         Ok(client) => {
@@ -393,6 +445,7 @@ pub fn run() {
             Some(Arc::new(TranslationService::new(
                 client,
                 Arc::clone(&cache),
+                l2_cache.clone(),
                 Arc::clone(&glossary),
             )))
         }
@@ -446,6 +499,7 @@ pub fn run() {
         screen_capture,
         screenshot_cache: parking_lot::Mutex::new(None),
         realtime_cancel: parking_lot::Mutex::new(None),
+        history_store: history_store.clone(),
     };
 
     tauri::Builder::default()
@@ -472,6 +526,7 @@ pub fn run() {
                     Arc::clone(&metrics),
                     Arc::clone(ts),
                     Arc::clone(&capture),
+                    history_store.clone(),
                     handle.clone(),
                 );
                 info!("P1 worker loop started");
@@ -525,7 +580,22 @@ pub fn run() {
             submit_ocr_selection,
             cancel_ocr_capture,
             stop_realtime,
+            get_history,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ciallo");
+}
+
+/// Determine the data directory for persistent storage (SQLite DBs).
+/// Uses XDG_DATA_HOME on Linux, falls back to ~/.local/share/ciallo.
+fn dirs_data_path() -> std::path::PathBuf {
+    let base = std::env::var("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            std::path::PathBuf::from(home).join(".local/share")
+        });
+    let dir = base.join("ciallo");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
 }

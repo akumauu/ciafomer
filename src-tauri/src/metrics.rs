@@ -173,4 +173,6 @@ pub mod metric_names {
     pub const CANCEL_LATENCY: &str = "cancel_latency";
     // Phase 4: Realtime incremental
     pub const REALTIME_CYCLE: &str = "t_realtime_cycle";
+    // Phase 5: History batch write
+    pub const HISTORY_BATCH_WRITE: &str = "t_history_batch_write";
 }

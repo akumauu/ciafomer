@@ -4,6 +4,7 @@
 pub mod normalize;
 pub mod glossary;
 pub mod cache;
+pub mod sqlite_cache;
 pub mod deepseek;
 
 use std::sync::Arc;
@@ -16,6 +17,7 @@ use cache::TranslationCache;
 use deepseek::DeepSeekClient;
 use glossary::Glossary;
 use normalize::PlaceholderProtector;
+use sqlite_cache::SqliteCache;
 
 /// Translation request.
 #[derive(Debug, Clone, Serialize)]
@@ -70,10 +72,11 @@ impl std::fmt::Display for TranslateError {
 }
 
 /// Orchestrates the full translation pipeline:
-/// normalize → glossary match → cache check → API call → restore placeholders → cache insert.
+/// normalize → glossary match → L1 cache → L2 cache → API call → restore placeholders → cache insert.
 pub struct TranslationService {
     pub client: DeepSeekClient,
     pub cache: Arc<TranslationCache>,
+    pub l2_cache: Option<Arc<SqliteCache>>,
     pub glossary: Arc<Glossary>,
     protector: PlaceholderProtector,
 }
@@ -82,11 +85,13 @@ impl TranslationService {
     pub fn new(
         client: DeepSeekClient,
         cache: Arc<TranslationCache>,
+        l2_cache: Option<Arc<SqliteCache>>,
         glossary: Arc<Glossary>,
     ) -> Self {
         Self {
             client,
             cache,
+            l2_cache,
             glossary,
             protector: PlaceholderProtector::new(),
         }
@@ -104,7 +109,8 @@ impl TranslationService {
     ) -> Result<TranslateResult, TranslateError> {
         // 1. Normalize: detect language + protect placeholders
         let norm = normalize::normalize(source_text);
-        let src_lang = norm.detected_lang.as_deref().unwrap_or("auto");
+        let src_lang_owned = norm.detected_lang.clone().unwrap_or_else(|| "auto".to_string());
+        let src_lang = src_lang_owned.as_str();
         debug!(
             src_lang = src_lang,
             placeholder_count = norm.placeholders.len(),
@@ -115,7 +121,7 @@ impl TranslationService {
         let matched_glossary = self.glossary.match_entries(source_text);
         debug!(matched_count = matched_glossary.len(), "glossary_matched");
 
-        // 3. Cache lookup
+        // 3. Cache lookup — L1 (memory)
         let cache_key = TranslationCache::compute_key(
             src_lang,
             target_lang,
@@ -123,7 +129,7 @@ impl TranslationService {
             &norm.normalized_text,
         );
         if let Some(cached) = self.cache.get(&cache_key) {
-            info!(request_id = request_id, "cache_hit");
+            info!(request_id = request_id, "L1_cache_hit");
             on_chunk(&cached);
             return Ok(TranslateResult {
                 request_id: request_id.to_string(),
@@ -133,6 +139,24 @@ impl TranslationService {
                 cached: true,
                 elapsed_ms: 0.0,
             });
+        }
+
+        // 3b. Cache lookup — L2 (SQLite, TTL 7d)
+        if let Some(ref l2) = self.l2_cache {
+            if let Some(cached) = l2.get(&cache_key) {
+                info!(request_id = request_id, "L2_cache_hit");
+                // Promote to L1
+                self.cache.insert(cache_key, cached.clone());
+                on_chunk(&cached);
+                return Ok(TranslateResult {
+                    request_id: request_id.to_string(),
+                    translated_text: cached,
+                    source_lang_detected: norm.detected_lang,
+                    tokens_used: 0,
+                    cached: true,
+                    elapsed_ms: 0.0,
+                });
+            }
         }
 
         // 4. API call with streaming
@@ -154,8 +178,16 @@ impl TranslationService {
         result.request_id = request_id.to_string();
         result.source_lang_detected = norm.detected_lang;
 
-        // 6. Cache insert
+        // 6. Cache insert — L1 + L2
         self.cache.insert(cache_key, result.translated_text.clone());
+        if let Some(ref l2) = self.l2_cache {
+            l2.insert(
+                &cache_key,
+                &result.translated_text,
+                src_lang,
+                target_lang,
+            );
+        }
 
         info!(
             request_id = request_id,

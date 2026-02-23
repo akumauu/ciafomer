@@ -12,6 +12,7 @@ use tracing::{info, warn, error};
 
 use crate::cancellation::CancelCoordinator;
 use crate::capture::TextCapture;
+use crate::history::{HistoryStore, HistoryRecord};
 use crate::metrics::{MetricsRegistry, metric_names};
 use crate::ocr::OcrEngine;
 use crate::state_machine::{AppState, StateMachine};
@@ -295,6 +296,7 @@ pub fn run_p1_loop(
     metrics: Arc<MetricsRegistry>,
     translation_service: Arc<TranslationService>,
     capture: Arc<dyn TextCapture>,
+    history_store: Option<Arc<HistoryStore>>,
     app_handle: tauri::AppHandle,
 ) {
     let mut rx = scheduler
@@ -482,6 +484,21 @@ pub fn run_p1_loop(
                         let _ = window.set_focus();
                     }
 
+                    // Phase 5: Record to history (async, non-blocking)
+                    if let Some(ref hs) = history_store {
+                        hs.record(HistoryRecord {
+                            request_id: request_id.clone(),
+                            source_text: source.clone(),
+                            translated_text: translated.clone(),
+                            source_lang: None,
+                            target_lang: "zh".to_string(),
+                            mode: "selection".to_string(),
+                            tokens_used: 0,
+                            cached: false,
+                            created_at: now_unix(),
+                        });
+                    }
+
                     let render_us = render_start.elapsed().as_micros() as f64;
                     metrics.record(metric_names::RENDER_DONE, render_us);
 
@@ -659,4 +676,12 @@ pub fn run_p2_loop(
 
         info!("P2 worker loop exiting");
     });
+}
+
+/// Current time as Unix timestamp (seconds).
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }

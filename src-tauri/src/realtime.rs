@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn, error};
 
 use crate::capture::screen::ScreenCapture;
+use crate::history::{HistoryStore, HistoryRecord};
 use crate::metrics::{MetricsRegistry, metric_names};
 use crate::ocr::{OcrLine, PythonOcrEngine, PreprocessConfig};
 use crate::state_machine::StateMachine;
@@ -155,6 +156,7 @@ pub async fn run_realtime_loop(
     app_handle: tauri::AppHandle,
     metrics: Arc<MetricsRegistry>,
     state_machine: Arc<StateMachine>,
+    history_store: Option<Arc<HistoryStore>>,
 ) {
     use tauri::Emitter;
 
@@ -371,6 +373,24 @@ pub async fn run_realtime_loop(
 
     let _ = app_handle.emit("realtime-stopped", final_stats);
 
+    // Phase 5: Record realtime session summary to history
+    if let Some(ref hs) = history_store {
+        if !session.line_cache.is_empty() {
+            let (source, translated) = session.build_merged(&session.previous_lines);
+            hs.record(HistoryRecord {
+                request_id: uuid::Uuid::new_v4().to_string(),
+                source_text: source,
+                translated_text: translated,
+                source_lang: None,
+                target_lang: "zh".to_string(),
+                mode: "realtime".to_string(),
+                tokens_used: 0,
+                cached: false,
+                created_at: now_unix(),
+            });
+        }
+    }
+
     // Transition back to Sleep
     state_machine.force_sleep();
 
@@ -379,4 +399,12 @@ pub async fn run_realtime_loop(
         let engine = Arc::clone(&ocr_engine);
         let _ = tokio::task::spawn_blocking(move || engine.reset_realtime()).await;
     }
+}
+
+/// Current time as Unix timestamp (seconds).
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }

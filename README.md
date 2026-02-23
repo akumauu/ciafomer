@@ -141,10 +141,10 @@ P0 通道处理**严禁**：
 | 模式面板 (预创建) | `tauri.conf.json` + `mode-panel.html` | hidden + transparent + alwaysOnTop，唤醒时 show + focus |
 | 前端状态同步 | `main.ts` | listen wake-detected/confirmed/rejected 事件，更新 UI |
 | WebAudio 音效 | `main.ts` | wake: 880Hz sine 150ms / reject: 330Hz sine 100ms |
-| 可观测性框架 | `metrics.rs` | SampleRing(1024) histogram, p50/p95/p99, 12 个命名指标 |
+| 可观测性框架 | `metrics.rs` | SampleRing(1024) histogram, p50/p95/p99, 13+ 个命名指标 |
 | Timing Span | `metrics.rs` → `TimingSpan` | 自动计时并记录到 histogram |
 | trace_id/request_id | `metrics.rs` → `RequestIds` | 每请求唯一标识 (UUID v4) |
-| Tauri 命令 | `lib.rs` | get_state / get_metrics_summary / select_mode / cancel_current / dismiss / get_screenshot_base64 / submit_ocr_selection / cancel_ocr_capture |
+| Tauri 命令 | `lib.rs` | get_state / get_metrics_summary / select_mode / cancel_current / dismiss / get_screenshot_base64 / submit_ocr_selection / cancel_ocr_capture / stop_realtime / get_history |
 | Python OCR Worker | `python-worker/worker.py` | PaddleOCR 延迟加载，idle≥60s 卸载，msgpack 帧协议 |
 | 术语表模板 | `glossary/default.json` | JSON 格式 source→target 映射 |
 
@@ -215,13 +215,26 @@ P0 通道处理**严禁**：
 | 实时渲染 | `result-panel.ts` | 每次 cycle 更新 source + translated 全文 |
 | 实时指标 | `metrics.rs` → `REALTIME_CYCLE` | t_realtime_cycle 周期耗时 histogram |
 
-### 未实现（Phase 5 计划）
+### 已实现 (Phase 5)
 
-| 功能 | Phase | 说明 |
-|------|-------|------|
-| 翻译缓存 L2 | Phase 5 | SQLite(TTL 7d) |
-| 历史记录批量写 | Phase 5 | 异步 300ms flush，不阻塞渲染 |
-| 稳定性打磨 | Phase 5 | 全面性能测试，KPI 达标验证 |
+| 功能 | 文件 | 说明 |
+|------|------|------|
+| 翻译缓存 L2 (SQLite) | `translate/sqlite_cache.rs` | SQLite 持久缓存，TTL 7 天，WAL 模式，自动过期清理 |
+| L2 缓存集成 | `translate/mod.rs` | L1 miss → L2 lookup → API；命中 L2 时自动 promote 到 L1 |
+| L2 缓存清理循环 | `translate/sqlite_cache.rs` → `start_cleanup_loop` | 专用线程每小时清理过期条目 |
+| 历史记录 SQLite 持久化 | `history.rs` | HistoryStore：翻译记录写入 SQLite，支持按时间倒序查询 |
+| 异步批量写 (300ms flush) | `history.rs` → `flush_loop` | Tokio task 300ms 间隔批量 INSERT (事务)，不阻塞渲染路径 |
+| 历史记录录入 (Selection) | `scheduler.rs` → `run_p1_loop` | P1 RenderResult 完成时异步写入历史 |
+| 历史记录录入 (Realtime) | `realtime.rs` → `run_realtime_loop` | 实时会话结束时写入历史摘要 |
+| get_history Tauri 命令 | `lib.rs` | 查询最近 N 条历史记录 |
+| 数据目录管理 | `lib.rs` → `dirs_data_path` | XDG_DATA_HOME/ciallo 自动创建 |
+| t_history_batch_write 指标 | `metrics.rs` | 历史批量写耗时 histogram |
+
+### 未实现（超出范围）
+
+| 功能 | 说明 |
+|------|------|
+| 真实唤醒词模型 | 当前用能量尖峰检测代替，需接入 keyword-spotting 模型 |
 
 ---
 
@@ -242,12 +255,13 @@ ciallo/
 │   │   └── 128x128@2x.png
 │   └── src/
 │       ├── main.rs                # 入口点
-│       ├── lib.rs                 # App 初始化 + Tauri 命令注册
+│       ├── lib.rs                 # App 初始化 + Tauri 命令注册 + SQLite/历史初始化
 │       ├── state_machine.rs       # 8 状态 FSM + 两阶段唤醒确认
-│       ├── scheduler.rs           # 三队列调度 (P0/P1/P2) + P0 handler
+│       ├── scheduler.rs           # 三队列调度 (P0/P1/P2) + P0 handler + 历史录入
 │       ├── cancellation.rs        # CancellationToken + GenerationGuard
 │       ├── metrics.rs             # 可观测性: histogram, timing span
 │       ├── realtime.rs            # Phase 4: 实时增量翻译 (像素差分+行级diff+行级缓存)
+│       ├── history.rs             # Phase 5: 历史记录 SQLite 持久化 + 异步 300ms 批量写
 │       ├── audio/
 │       │   ├── mod.rs             # 音频管道: cpal → RingBuffer → VAD → Wake
 │       │   ├── ring_buffer.rs     # 固定预分配环形缓冲区 (3s)
@@ -263,7 +277,8 @@ ciallo/
 │           ├── mod.rs             # TranslationService 编排层
 │           ├── normalize.rs       # 语言检测 + 占位符保护/恢复
 │           ├── glossary.rs        # 术语表加载与匹配
-│           ├── cache.rs           # LRU(512) + blake3 key + TTL 缓存
+│           ├── cache.rs           # L1: LRU(512) + blake3 key + TTL 缓存
+│           ├── sqlite_cache.rs    # L2: SQLite 持久缓存 (TTL 7d, WAL 模式)
 │           └── deepseek.rs        # DeepSeek API 客户端 (SSE streaming + retry)
 ├── src/                           # 前端 (TypeScript + CSS)
 │   ├── index.html                 # 主窗口 HTML
@@ -356,13 +371,13 @@ ciallo/
 - `SampleRing(1024)` — 固定容量环形缓冲，无动态扩容
 - 按需计算 percentile：排序后取 `p * (n-1)` 位置
 
-**12 个命名指标：**
+**13 个命名指标：**
 ```
 t_wake_detected, t_wake_ui_emitted, t_mode_panel_visible,
 t_capture_done, t_ocr_done, t_translate_first_chunk,
 t_translate_done, t_render_done,
 queue_wait_p0, queue_wait_p1, queue_wait_p2,
-cancel_latency
+cancel_latency, t_realtime_cycle, t_history_batch_write
 ```
 
 **Tauri 命令 `get_metrics_summary`** 可随时查询所有指标的 p50/p95/p99。
@@ -470,10 +485,46 @@ Phase 2 完整翻译管道，由 `TranslationService` 编排。
 **mod.rs — TranslationService：**
 1. normalize (语言检测 + 占位符保护)
 2. glossary match (仅命中项)
-3. cache lookup (blake3 key)
-4. API call (SSE streaming + on_chunk callback)
-5. restore placeholders
-6. cache insert
+3. L1 cache lookup (blake3 key)
+4. L2 cache lookup (SQLite, promote to L1 on hit)
+5. API call (SSE streaming + on_chunk callback)
+6. restore placeholders
+7. cache insert (L1 + L2)
+
+### 15. 翻译缓存 L2 (`translate/sqlite_cache.rs`) — Phase 5
+
+SQLite 持久化的二级翻译缓存，跨会话复用翻译结果。
+
+**设计要点：**
+- WAL (Write-Ahead Logging) 模式：读写可并发
+- Key = blake3 hash blob (与 L1 相同)
+- TTL 7 天：`created_at` 字段 + 查询时过滤
+- 自动清理：专用线程每小时 `DELETE WHERE created_at <= cutoff`
+- Mutex 保护的单连接（写入量低，无需连接池）
+
+**缓存层级：**
+```
+L1 miss → L2 lookup → API call
+                ↓ hit
+          promote to L1
+```
+
+### 16. 历史记录 (`history.rs`) — Phase 5
+
+异步批量写的翻译历史持久化模块。
+
+**核心类型：**
+- `HistoryRecord` — 单条记录：request_id, source/translated, mode, tokens, cached, created_at
+- `HistoryStore` — unbounded channel 接收 + 300ms flush 批量写
+
+**异步批量写：**
+- `record()` — 非阻塞发送到 unbounded channel
+- `flush_loop()` — Tokio task，300ms interval，drain all pending → 事务 batch INSERT
+- 读写分离：独立的 `read_conn` (查询) 和 `write_conn` (写入)
+
+**查询：**
+- `query_recent(limit)` — 按时间倒序返回最近 N 条记录
+- `cleanup_older_than_days(days)` — 清理过旧记录
 
 ### 12. 文本采集 (`capture/`)
 
@@ -523,12 +574,12 @@ Phase 2 完整翻译管道，由 `TranslationService` 编排。
 |------|------|---------|
 | 唤醒反馈 (Wake→UI) | p95 < 250ms, p99 < 400ms | 框架就绪，埋点已实现 |
 | 模式面板出现 | p95 < 300ms, p99 < 500ms | 预创建 hidden + show，埋点就绪 |
-| 选中翻译首条译文 | p95 < 800ms, p99 < 1.2s | Phase 2 链路完成，待实测 |
-| OCR 翻译首条译文 | p95 < 1.2s, p99 < 2.0s | Phase 3 链路完成，待实测 |
+| 选中翻译首条译文 | p95 < 800ms, p99 < 1.2s | Phase 2 链路完成 + Phase 5 L2 缓存加速，待实测 |
+| OCR 翻译首条译文 | p95 < 1.2s, p99 < 2.0s | Phase 3 链路完成 + Phase 5 L2 缓存加速，待实测 |
 | 高优任务排队等待 | p95 < 80ms, p99 < 120ms | crossbeam 无界 + 专用线程 |
 | 待机 CPU | < 2% | 预期达标 (sleep loop) |
 | 待机内存 | < 200MB | 预期达标 (~96KB ring buffer) |
-| Token 节省 (增量 vs 全量) | >= 40% | Phase 4 完成：行级缓存 + line-hash diff，待实测验证 |
+| Token 节省 (增量 vs 全量) | >= 40% | Phase 4 行级缓存 + Phase 5 L2 持久缓存，待实测验证 |
 
 ---
 
@@ -728,9 +779,35 @@ cargo run
 - `src/main.ts` — 新增 realtime-started/update/error/stopped 事件监听
 - `src/result-panel.ts` — 新增 realtime-update / realtime-stopped 事件处理
 
-### Phase 5: 稳定性与性能 [计划中]
+### Phase 5: 限流/连接池/持久缓存/历史批量写/稳定性与性能打磨 [已完成]
 
-**目标：** 限流/连接池/持久缓存/历史批量写/全面 KPI 验证。
+**目标：** 持久缓存 L2 (SQLite)、历史记录异步批量写、全链路稳定性打磨。
+
+**完成内容：**
+1. `SqliteCache` 翻译缓存 L2：SQLite WAL 模式，TTL 7 天，blake3 key，自动过期清理（每小时，专用线程）
+2. L2 缓存集成到 `TranslationService`：L1 miss → L2 lookup → API call；L2 命中时 promote 到 L1；API 成功后同时写入 L1 + L2
+3. `HistoryStore` 历史记录持久化：SQLite 存储翻译记录（request_id, source, translated, mode, tokens, cached, timestamp）
+4. 异步批量写 (300ms flush)：unbounded channel + Tokio task，300ms 间隔批量 INSERT 事务，绝不阻塞渲染路径
+5. 读写分离：history 使用独立的 read/write Connection（两个 SQLite 连接，WAL 模式允许并行）
+6. P1 RenderResult 历史录入：翻译完成后 selection 模式自动写入历史
+7. 实时会话历史录入：realtime loop 结束时写入最终翻译摘要
+8. `get_history` Tauri 命令：查询最近 N 条历史记录（默认 50，按时间倒序）
+9. 数据目录管理：`dirs_data_path()` 使用 XDG_DATA_HOME，自动创建 `~/.local/share/ciallo/`
+10. `t_history_batch_write` 可观测性指标
+
+**编译状态：** `cargo check` 通过 + `npm run build` 通过 (零错误零警告)
+
+**新增文件：**
+- `src-tauri/src/translate/sqlite_cache.rs` — L2 SQLite 翻译缓存 (TTL 7d, WAL, 自动清理)
+- `src-tauri/src/history.rs` — 历史记录 SQLite 持久化 + 异步 300ms 批量写
+
+**修改文件：**
+- `src-tauri/Cargo.toml` — 新增 rusqlite (bundled) 依赖
+- `src-tauri/src/translate/mod.rs` — L2 缓存集成 (TranslationService 新增 l2_cache 字段)
+- `src-tauri/src/lib.rs` — SQLite/HistoryStore 初始化、get_history 命令、AppContext 扩展
+- `src-tauri/src/scheduler.rs` — run_p1_loop 接受 history_store 参数，RenderResult 写入历史
+- `src-tauri/src/realtime.rs` — run_realtime_loop 接受 history_store 参数，会话结束写入历史
+- `src-tauri/src/metrics.rs` — 新增 HISTORY_BATCH_WRITE 指标
 
 ---
 
@@ -803,14 +880,17 @@ cargo run
 - [x] 实时循环控制 (stop_realtime + cancel 集成)
 - [x] 实时事件体系 (realtime-started/update/error/stopped)
 - [x] t_realtime_cycle 指标
+- [x] 翻译缓存 L2 (SQLite, TTL 7d, WAL 模式, 自动过期清理)
+- [x] L2 缓存集成 (L1 miss → L2 → API, promote on hit)
+- [x] 历史记录 SQLite 持久化 (HistoryStore)
+- [x] 异步批量写 (300ms flush, unbounded channel + Tokio task)
+- [x] get_history Tauri 命令
+- [x] t_history_batch_write 指标
 
 ### 未实现
 
 - [ ] 真实唤醒词模型 (当前用能量尖峰检测代替)
-- [ ] 翻译缓存 L2 (SQLite, TTL 7d)
-- [ ] 历史记录 SQLite 持久化
-- [ ] 异步批量写 (300ms flush)
-- [ ] 全面 KPI 性能验证
+- [ ] 全面 KPI 性能验证 (需真实硬件环境实测)
 
 ---
 
@@ -913,6 +993,12 @@ cargo run
 | 复用 capture-overlay 选区 UI | 实时模式和 OCR 模式共享选区流程，减少代码重复 |
 | 实时循环独立于 P1/P2 队列 | 循环需要同步获取 OCR 结果做 diff，不适合队列异步模式 |
 | CancellationToken 独立管理 | 实时循环有独立 cancel token，不受 P1/P2 generation 影响 |
+| rusqlite bundled | 自带 SQLite 编译，无需系统 libsqlite3，跨平台一致 |
+| WAL 模式 | 读写可并发，不阻塞查询 |
+| 读写分离 (history) | 独立的 read/write Connection，WAL 允许并行读写 |
+| unbounded channel (history) | 历史写入绝不阻塞渲染路径，即使 flush 暂时延迟 |
+| 300ms flush interval | 平衡写入延迟与 I/O 频率，批量事务提升吞吐 |
+| XDG_DATA_HOME | 遵循 Linux 标准目录规范，数据存储在 ~/.local/share/ciallo/ |
 
 ---
 

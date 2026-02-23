@@ -30,6 +30,9 @@ regex = "1"
 rmp-serde = "1"
 base64 = "0.22"
 
+# Phase 5: SQLite persistent cache + history
+rusqlite = { version = "0.31", features = ["bundled"] }
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
