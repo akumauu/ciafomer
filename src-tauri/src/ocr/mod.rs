@@ -1,6 +1,7 @@
 //! OCR module — engine interface and Python worker IPC.
 //! Phase 2: trait redesign.
 //! Phase 3: PythonOcrEngine implementation (PaddleOCR + OpenCV via IPC).
+//! Phase 4: RealtimeOcrResult for pixel diff change detection.
 
 pub mod python_engine;
 
@@ -57,6 +58,18 @@ impl Default for PreprocessConfig {
 pub struct OcrResult {
     pub request_id: String,
     pub lines: Vec<OcrLine>,
+    pub elapsed_ms: f64,
+}
+
+/// Phase 4: Realtime OCR result with pixel diff change detection.
+#[derive(Debug, Clone)]
+pub struct RealtimeOcrResult {
+    /// Whether the frame changed compared to the previous one.
+    pub changed: bool,
+    /// OCR lines (empty if no change).
+    pub lines: Vec<OcrLine>,
+    /// Mean Absolute Error between current and previous frame.
+    pub mae: f64,
     pub elapsed_ms: f64,
 }
 

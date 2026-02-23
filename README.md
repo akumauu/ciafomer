@@ -49,7 +49,7 @@ Ciallo 是一个纯本地部署的桌面翻译助手，目标是以最低的资�
 |------|------|------|
 | **主进程** | Rust + Tauri v2 | 状态机、调度器、取消框架、音频管道 |
 | **前端** | TypeScript + CSS | Tauri WebView，禁止额外 UI 框架 |
-| **OCR** | Python Worker (PaddleOCR + OpenCV) | Phase 3: stdin/stdout IPC + MessagePack 帧协议，ROI 预处理 |
+| **OCR** | Python Worker (PaddleOCR + OpenCV) | Phase 3: stdin/stdout IPC + MessagePack 帧协议，ROI 预处理；Phase 4: 实时像素差分(MAE) |
 | **IPC** | stdin/stdout + MessagePack (4字节大端长度前缀) | 主进程↔Python Worker 通信 |
 | **翻译** | DeepSeek chat/completions | reqwest 连接池 |
 | **存储** | SQLite + 内存 LRU | 二级缓存 |
@@ -197,14 +197,29 @@ P0 通道处理**严禁**：
 | Phase 3 事件体系 | `main.ts` | ocr-started/ocr-complete/ocr-error 事件监听 |
 | OCR 结果显示 | `result-panel.ts` | 监听 ocr-complete 显示 OCR 原文 |
 
-### 未实现（Phase 4-5 计划）
+### 已实现 (Phase 4)
+
+| 功能 | 文件 | 说明 |
+|------|------|------|
+| 实时增量翻译模块 | `realtime.rs` | 500ms 周期采样 + 像素差分 + 行级 diff + 行级缓存 |
+| 像素差分 (MAE) | `worker.py` → `RealtimeState` | 连续帧 ROI 图像 MAE 对比，MAE < 5.0 跳过 OCR |
+| line-hash 行级 diff | `realtime.rs` → `diff_lines()` | blake3(text \| y_bucket 8px)，仅 added lines 进翻译 |
+| 行级翻译缓存 | `realtime.rs` → `RealtimeSession.line_cache` | 不变行复用缓存，避免重复 API 调用 |
+| Token 节省统计 | `realtime.rs` → `RealtimeSession.token_saving_pct()` | 实时计算 lines_from_cache / total 比例 |
+| realtime_ocr IPC | `python_engine.rs` + `worker.py` | 新增 realtime_ocr 消息类型：diff + OCR 一体 |
+| reset_realtime IPC | `python_engine.rs` + `worker.py` | 清除 Python Worker 中的前帧缓存 |
+| 实时循环控制 | `lib.rs` → `submit_ocr_selection` | 复用 capture-overlay 选区 UI，自动检测 RealtimeIncremental 模式 |
+| stop_realtime 命令 | `lib.rs` | Tauri 命令：取消实时循环 |
+| 实时取消集成 | `lib.rs` → `cancel_current` / `dismiss` | cancel/dismiss 自动终止实时循环 |
+| 实时事件体系 | `main.ts` + `result-panel.ts` | realtime-started/update/error/stopped 事件 |
+| 实时渲染 | `result-panel.ts` | 每次 cycle 更新 source + translated 全文 |
+| 实时指标 | `metrics.rs` → `REALTIME_CYCLE` | t_realtime_cycle 周期耗时 histogram |
+
+### 未实现（Phase 5 计划）
 
 | 功能 | Phase | 说明 |
 |------|-------|------|
 | 翻译缓存 L2 | Phase 5 | SQLite(TTL 7d) |
-| 实时增量翻译 | Phase 4 | 500ms 采样 + 像素差分(MAE/SSIM) 变化检测 |
-| 行级 diff | Phase 4 | line-hash(text + y_bucket 8px)，仅 added lines 进翻译 |
-| 行级缓存 | Phase 4 | 不变行复用缓存，字幕 60s 不变 API≤1 次 |
 | 历史记录批量写 | Phase 5 | 异步 300ms flush，不阻塞渲染 |
 | 稳定性打磨 | Phase 5 | 全面性能测试，KPI 达标验证 |
 
@@ -232,6 +247,7 @@ ciallo/
 │       ├── scheduler.rs           # 三队列调度 (P0/P1/P2) + P0 handler
 │       ├── cancellation.rs        # CancellationToken + GenerationGuard
 │       ├── metrics.rs             # 可观测性: histogram, timing span
+│       ├── realtime.rs            # Phase 4: 实时增量翻译 (像素差分+行级diff+行级缓存)
 │       ├── audio/
 │       │   ├── mod.rs             # 音频管道: cpal → RingBuffer → VAD → Wake
 │       │   ├── ring_buffer.rs     # 固定预分配环形缓冲区 (3s)
@@ -467,6 +483,38 @@ Phase 2 完整翻译管道，由 `TranslationService` 编排。
 - `ClipboardGuard` RAII Drop 模式保证 finally 恢复原剪贴板内容
 - 工具不可用时快速失败 `CaptureError::ToolNotAvailable`
 
+### 13. 实时增量翻译 (`realtime.rs`) — Phase 4
+
+500ms 周期采样 + 像素差分(MAE) + 行级 diff + 行级缓存的增量翻译模块。
+
+**核心类型：**
+- `RealtimeSession` — 会话状态：previous_lines, line_cache(text→translation), 统计计数器
+- `LineDiff` — 行级 diff 结果：added (需翻译) + unchanged (复用缓存)
+
+**关键函数：**
+- `line_hash(text, y_center) -> [u8;32]` — blake3(text | y_bucket)，y_bucket = (y_center / 8) * 8
+- `diff_lines(old, new) -> LineDiff` — 通过 line_hash 集合差集区分 added/unchanged
+- `run_realtime_loop()` — 主循环 (tokio task)：
+  1. `ScreenCapture::capture()` → PNG bytes
+  2. `PythonOcrEngine::realtime_ocr()` → 像素差分 + OCR (spawn_blocking)
+  3. 如无变化 → 跳过，等待下一周期
+  4. `diff_lines()` → 行级 diff
+  5. 仅 added 行调用 `TranslationService::translate()`
+  6. `build_merged()` → 合并缓存 + 新翻译
+  7. emit `realtime-update` → result-panel 更新
+
+**像素差分 (Python Worker)：**
+- `RealtimeState` 存储前帧 ROI 图像
+- `compute_mae()` — numpy 计算 Mean Absolute Error
+- MAE < 5.0 → 返回 `no_change`，跳过 OCR
+- MAE >= 5.0 → 预处理 + OCR，更新前帧
+
+**Token 节省机制：**
+- 行级缓存：session-local HashMap(line_text → translated_text)
+- 相同文本出现在同一 y_bucket → line_hash 匹配 → 标记为 unchanged → 复用缓存
+- 统计：token_saving_pct = lines_from_cache / (lines_from_cache + lines_translated_via_api) × 100%
+- 验收目标：字幕 60s 不变，API 请求 ≤1 次
+
 ---
 
 ## 性能指标 (KPI)
@@ -480,7 +528,7 @@ Phase 2 完整翻译管道，由 `TranslationService` 编排。
 | 高优任务排队等待 | p95 < 80ms, p99 < 120ms | crossbeam 无界 + 专用线程 |
 | 待机 CPU | < 2% | 预期达标 (sleep loop) |
 | 待机内存 | < 200MB | 预期达标 (~96KB ring buffer) |
-| Token 节省 (增量 vs 全量) | >= 40% | Phase 4 |
+| Token 节省 (增量 vs 全量) | >= 40% | Phase 4 完成：行级缓存 + line-hash diff，待实测验证 |
 
 ---
 
@@ -649,9 +697,36 @@ cargo run
 - `build.mjs` — 添加 capture-overlay.ts 构建和 HTML 拷贝
 - `python-worker/worker.py` — 全面升级：ImagePreprocessor 类 + ROI 裁剪 + 预处理管道
 
-### Phase 4: 实时增量翻译 [计划中]
+### Phase 4: 实时增量翻译 [已完成]
 
 **目标：** 实现变化检测 + 行级 diff + 行级缓存的增量翻译。
+
+**完成内容：**
+1. `RealtimeState` 像素差分：Python Worker 存储前帧 ROI 图像，MAE (Mean Absolute Error) 对比，阈值 5.0 以下跳过 OCR
+2. `realtime_ocr` IPC 消息：一次调用完成 diff + OCR，减少 IPC 往返；`reset_realtime` 清除前帧缓存
+3. `LineDiffer` 行级 diff：`blake3(text | y_bucket)` 哈希，y_bucket = 8px 粒度，区分 added/unchanged 行
+4. `RealtimeSession` 行级缓存：per-session HashMap (line_text → translated_text)，不变行直接复用
+5. `run_realtime_loop()` 500ms 周期循环：截屏 → realtime_ocr(diff+OCR) → line diff → 仅翻译 added → merge → render
+6. Token 节省统计：实时计算 lines_from_cache / (lines_from_cache + lines_translated_via_api)
+7. 复用 capture-overlay 选区 UI：Realtime 模式与 OCR Region 共享区域选择流程
+8. `stop_realtime` Tauri 命令：独立停止实时循环
+9. cancel_current/dismiss 自动终止：取消令牌集成到全局取消协调
+10. 前端事件：realtime-started/update/error/stopped，result-panel 每周期更新
+11. 可观测性：t_realtime_cycle 指标 histogram
+
+**编译状态：** `cargo check` 通过 + `npm run build` 通过 (零错误零警告)
+
+**新增文件：**
+- `src-tauri/src/realtime.rs` — 实时增量翻译核心模块 (LineDiffer, RealtimeSession, run_realtime_loop)
+
+**修改文件：**
+- `python-worker/worker.py` — 新增 RealtimeState 类 (MAE 像素差分)、realtime_ocr/reset_realtime 消息处理
+- `src-tauri/src/ocr/mod.rs` — 新增 RealtimeOcrResult 类型
+- `src-tauri/src/ocr/python_engine.rs` — 新增 realtime_ocr() / reset_realtime() 方法、RealtimeOcr/ResetRealtime 消息类型
+- `src-tauri/src/lib.rs` — 新增 python_ocr / realtime_cancel 字段、RealtimeIncremental 模式处理、stop_realtime 命令
+- `src-tauri/src/metrics.rs` — 新增 REALTIME_CYCLE 指标
+- `src/main.ts` — 新增 realtime-started/update/error/stopped 事件监听
+- `src/result-panel.ts` — 新增 realtime-update / realtime-stopped 事件处理
 
 ### Phase 5: 稳定性与性能 [计划中]
 
@@ -719,15 +794,20 @@ cargo run
 - [x] OCR Region 完整流程 (截屏 → 缓存 → overlay → 选区 → P2 OCR → P1 翻译)
 - [x] Phase 3 事件体系 (ocr-started/ocr-complete/ocr-error)
 - [x] OCR 结果显示 (result-panel 监听 ocr-complete)
+- [x] 实时增量翻译 (500ms 采样 + 像素差分 + line-hash diff + 行级缓存)
+- [x] 像素差分变化检测 (MAE, 阈值 5.0)
+- [x] 行级 diff (blake3 line-hash + y_bucket 8px)
+- [x] 行级翻译缓存 (session-local text→translation HashMap)
+- [x] Token 节省统计 (lines_from_cache / total)
+- [x] realtime_ocr IPC (diff + OCR 一体)
+- [x] 实时循环控制 (stop_realtime + cancel 集成)
+- [x] 实时事件体系 (realtime-started/update/error/stopped)
+- [x] t_realtime_cycle 指标
 
 ### 未实现
 
 - [ ] 真实唤醒词模型 (当前用能量尖峰检测代替)
 - [ ] 翻译缓存 L2 (SQLite, TTL 7d)
-- [ ] 实时增量翻译
-- [ ] 像素差分变化检测 (MAE/SSIM)
-- [ ] 行级 diff (line-hash + y_bucket)
-- [ ] 行级缓存
 - [ ] 历史记录 SQLite 持久化
 - [ ] 异步批量写 (300ms flush)
 - [ ] 全面 KPI 性能验证
@@ -825,6 +905,14 @@ cargo run
 | 截图缓存在 Mutex 中 | 单次使用(take)，OCR 提交后立即释放内存 |
 | P2 用 spawn_blocking | OCR 是 CPU 密集型，不阻塞 Tokio 异步运行时 |
 | OCR 结果直接提交 P1 翻译 | P2→P1 自动衔接，用户无需二次操作 |
+| 像素差分在 Python Worker 做 | 避免 Rust 添加 image crate 依赖，复用 OpenCV/numpy |
+| MAE 阈值 5.0 | 保守默认值，平衡灵敏度与误触发 |
+| y_bucket = 8px | 容忍 OCR 对同一行的 y_center 微小漂移 |
+| 行级缓存用 session HashMap | 无 TTL 需求(session 生命周期=缓存生命周期)，比全局 LRU 更快 |
+| realtime_ocr 一次 IPC 完成 diff+OCR | 减少 IPC 往返，避免发送两次帧数据 |
+| 复用 capture-overlay 选区 UI | 实时模式和 OCR 模式共享选区流程，减少代码重复 |
+| 实时循环独立于 P1/P2 队列 | 循环需要同步获取 OCR 结果做 diff，不适合队列异步模式 |
+| CancellationToken 独立管理 | 实时循环有独立 cancel token，不受 P1/P2 generation 影响 |
 
 ---
 

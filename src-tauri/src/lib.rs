@@ -9,11 +9,13 @@ pub mod audio;
 pub mod capture;
 pub mod ocr;
 pub mod translate;
+pub mod realtime;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::collections::HashMap;
 use tauri::Manager;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use state_machine::StateMachine;
@@ -35,12 +37,16 @@ pub struct AppContext {
     pub cancel: Arc<CancelCoordinator>,
     pub metrics: Arc<MetricsRegistry>,
     pub translation_service: Option<Arc<TranslationService>>,
-    /// OCR engine (Python worker IPC).
+    /// OCR engine (Python worker IPC) — trait object for P2 queue.
     pub ocr_engine: Option<Arc<dyn OcrEngine>>,
+    /// Concrete PythonOcrEngine for realtime methods (realtime_ocr, reset_realtime).
+    pub python_ocr: Option<Arc<PythonOcrEngine>>,
     /// Screen capture utility.
     pub screen_capture: Arc<ScreenCapture>,
-    /// Cached screenshot bytes for OCR region selection.
+    /// Cached screenshot bytes for OCR region / realtime region selection.
     pub screenshot_cache: parking_lot::Mutex<Option<Vec<u8>>>,
+    /// Phase 4: Cancellation token for the realtime incremental loop.
+    pub realtime_cancel: parking_lot::Mutex<Option<CancellationToken>>,
 }
 
 // --- Tauri Commands ---
@@ -116,9 +122,35 @@ fn select_mode(
             }
         }
         state_machine::TranslateMode::RealtimeIncremental => {
-            // Phase 4: realtime incremental translation
-            warn!("realtime incremental mode not yet implemented (Phase 4)");
-            ctx.state_machine.force_sleep();
+            // Phase 4: Realtime incremental translation.
+            // Same overlay flow as OCR Region: capture screenshot → show overlay → user selects ROI.
+            // Then submit_ocr_selection detects realtime mode and starts the loop.
+            if ctx.python_ocr.is_none() || ctx.translation_service.is_none() {
+                warn!("realtime mode requires OCR engine and translation service");
+                ctx.state_machine.force_sleep();
+                return Ok(format!("{}", ctx.state_machine.current()));
+            }
+
+            match ctx.screen_capture.capture() {
+                Ok(png_bytes) => {
+                    info!(size = png_bytes.len(), "screenshot captured for realtime region selection");
+                    *ctx.screenshot_cache.lock() = Some(png_bytes);
+
+                    if let Some(w) = app.get_webview_window("capture-overlay") {
+                        let _ = w.show();
+                        let _ = w.set_focus();
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "screen capture failed for realtime");
+                    use tauri::Emitter;
+                    let _ = app.emit(
+                        "realtime-error",
+                        serde_json::json!({ "error": format!("Screen capture failed: {e}") }),
+                    );
+                    ctx.state_machine.force_sleep();
+                }
+            }
         }
     }
 
@@ -141,8 +173,8 @@ fn get_screenshot_base64(ctx: tauri::State<'_, AppContext>) -> Result<String, St
 }
 
 /// Submit an OCR region selection from the capture overlay.
-/// `roi_type`: "rect" | "polygon" | "perspective"
-/// `roi_params`: depends on type (see OcrRoi variants)
+/// For OcrRegion mode: submits to P2 queue for single OCR + translation.
+/// For RealtimeIncremental mode: starts the realtime loop with the selected ROI.
 #[tauri::command]
 fn submit_ocr_selection(
     ctx: tauri::State<'_, AppContext>,
@@ -155,7 +187,51 @@ fn submit_ocr_selection(
         let _ = w.hide();
     }
 
-    // Get screenshot bytes
+    let current_mode = ctx.state_machine.current_mode();
+
+    // Check if this is realtime mode
+    if current_mode == Some(state_machine::TranslateMode::RealtimeIncremental) {
+        // Phase 4: Start realtime loop (don't consume screenshot cache — loop captures its own)
+        *ctx.screenshot_cache.lock() = None;
+
+        let python_ocr = ctx.python_ocr.as_ref()
+            .ok_or_else(|| "OCR engine not available".to_string())?
+            .clone();
+        let translation_service = ctx.translation_service.as_ref()
+            .ok_or_else(|| "translation service not available".to_string())?
+            .clone();
+
+        // Cancel any existing realtime loop
+        if let Some(old_token) = ctx.realtime_cancel.lock().take() {
+            old_token.cancel();
+        }
+
+        // Create new cancellation token for the realtime loop
+        let cancel_token = CancellationToken::new();
+        *ctx.realtime_cancel.lock() = Some(cancel_token.clone());
+
+        let screen_capture = Arc::clone(&ctx.screen_capture);
+        let metrics = Arc::clone(&ctx.metrics);
+        let state_machine = Arc::clone(&ctx.state_machine);
+        let handle = app.clone();
+
+        tokio::spawn(realtime::run_realtime_loop(
+            python_ocr,
+            screen_capture,
+            translation_service,
+            cancel_token,
+            roi_type.clone(),
+            roi_params.clone(),
+            handle,
+            metrics,
+            state_machine,
+        ));
+
+        info!(roi_type = %roi_type, "realtime loop started");
+        return Ok("realtime_started".to_string());
+    }
+
+    // Normal OCR Region mode: submit to P2 queue
     let image_data = ctx
         .screenshot_cache
         .lock()
@@ -241,14 +317,32 @@ fn cancel_ocr_capture(ctx: tauri::State<'_, AppContext>, app: tauri::AppHandle) 
     info!("OCR capture cancelled");
 }
 
+/// Phase 4: Stop the realtime incremental translation loop.
+#[tauri::command]
+fn stop_realtime(ctx: tauri::State<'_, AppContext>) {
+    if let Some(token) = ctx.realtime_cancel.lock().take() {
+        token.cancel();
+        info!("realtime loop stop requested");
+    }
+    ctx.state_machine.force_sleep();
+}
+
 #[tauri::command]
 fn cancel_current(ctx: tauri::State<'_, AppContext>) {
+    // Also cancel realtime loop if running
+    if let Some(token) = ctx.realtime_cancel.lock().take() {
+        token.cancel();
+    }
     ctx.scheduler.preempt_for_wake();
     ctx.state_machine.force_sleep();
 }
 
 #[tauri::command]
 fn dismiss(ctx: tauri::State<'_, AppContext>, app: tauri::AppHandle) {
+    // Also cancel realtime loop if running
+    if let Some(token) = ctx.realtime_cancel.lock().take() {
+        token.cancel();
+    }
     ctx.state_machine.force_sleep();
     if let Some(w) = app.get_webview_window("mode-panel") {
         let _ = w.hide();
@@ -318,7 +412,7 @@ pub fn run() {
     let screen_capture = Arc::new(ScreenCapture::new());
 
     // Create OCR engine (Python worker)
-    let ocr_engine: Option<Arc<dyn OcrEngine>> = {
+    let python_ocr: Option<Arc<PythonOcrEngine>> = {
         let worker_script = std::path::PathBuf::from("../python-worker/worker.py");
         // Try to find Python binary: prefer venv, fallback to system
         let python_bin = if std::path::Path::new("../python-worker/.venv/bin/python3").exists() {
@@ -336,6 +430,11 @@ pub fn run() {
         Some(engine)
     };
 
+    // Create trait-object OCR engine from PythonOcrEngine
+    let ocr_engine: Option<Arc<dyn OcrEngine>> = python_ocr
+        .as_ref()
+        .map(|e| Arc::clone(e) as Arc<dyn OcrEngine>);
+
     let app_context = AppContext {
         state_machine: Arc::clone(&state_machine),
         scheduler: Arc::clone(&scheduler),
@@ -343,8 +442,10 @@ pub fn run() {
         metrics: Arc::clone(&metrics),
         translation_service: translation_service.clone(),
         ocr_engine: ocr_engine.clone(),
+        python_ocr: python_ocr.clone(),
         screen_capture,
         screenshot_cache: parking_lot::Mutex::new(None),
+        realtime_cancel: parking_lot::Mutex::new(None),
     };
 
     tauri::Builder::default()
@@ -423,6 +524,7 @@ pub fn run() {
             get_screenshot_base64,
             submit_ocr_selection,
             cancel_ocr_capture,
+            stop_realtime,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ciallo");

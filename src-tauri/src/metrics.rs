@@ -171,4 +171,6 @@ pub mod metric_names {
     pub const QUEUE_WAIT_P1: &str = "queue_wait_p1";
     pub const QUEUE_WAIT_P2: &str = "queue_wait_p2";
     pub const CANCEL_LATENCY: &str = "cancel_latency";
+    // Phase 4: Realtime incremental
+    pub const REALTIME_CYCLE: &str = "t_realtime_cycle";
 }

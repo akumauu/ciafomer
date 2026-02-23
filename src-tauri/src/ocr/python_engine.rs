@@ -13,7 +13,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use super::{OcrEngine, OcrError, OcrLine, OcrRequest, OcrResult, RoiParams, RoiType};
+use super::{OcrEngine, OcrError, OcrLine, OcrRequest, OcrResult, RealtimeOcrResult, RoiParams, RoiType};
 
 /// Managed Python worker process with stdin/stdout handles.
 struct WorkerProcess {
@@ -95,6 +95,16 @@ enum WorkerMessage {
     },
     #[serde(rename = "shutdown")]
     Shutdown,
+    #[serde(rename = "realtime_ocr")]
+    RealtimeOcr {
+        #[serde(with = "serde_bytes")]
+        image_data: Vec<u8>,
+        roi_type: String,
+        roi_params: serde_json::Value,
+        preprocess: PreprocessMsg,
+    },
+    #[serde(rename = "reset_realtime")]
+    ResetRealtime,
 }
 
 mod serde_bytes {
@@ -120,6 +130,7 @@ struct WorkerResponse {
     request_id: Option<String>,
     lines: Option<Vec<WorkerOcrLine>>,
     elapsed_ms: Option<f64>,
+    mae: Option<f64>,
     message: Option<String>,
 }
 
@@ -300,6 +311,81 @@ impl PythonOcrEngine {
                 "fullframe".to_string(),
                 serde_json::json!({}),
             ),
+        }
+    }
+
+    /// Phase 4: Realtime OCR with pixel diff (MAE).
+    /// Sends the frame to Python worker which compares with previous frame
+    /// and only runs OCR if change is detected.
+    pub fn realtime_ocr(
+        &self,
+        image_data: Vec<u8>,
+        roi_type: &str,
+        roi_params: &serde_json::Value,
+        preprocess: &super::PreprocessConfig,
+    ) -> Result<RealtimeOcrResult, OcrError> {
+        let msg = WorkerMessage::RealtimeOcr {
+            image_data,
+            roi_type: roi_type.to_string(),
+            roi_params: roi_params.clone(),
+            preprocess: PreprocessMsg {
+                grayscale: preprocess.grayscale,
+                adaptive_threshold: preprocess.adaptive_threshold,
+                denoise: preprocess.denoise,
+                deskew: preprocess.deskew,
+            },
+        };
+
+        let response = self.send_recv(&msg)?;
+
+        match response.msg_type.as_str() {
+            "no_change" => Ok(RealtimeOcrResult {
+                changed: false,
+                lines: vec![],
+                mae: response.mae.unwrap_or(0.0),
+                elapsed_ms: response.elapsed_ms.unwrap_or(0.0),
+            }),
+            "ocr_result" => {
+                let lines = response
+                    .lines
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|l| OcrLine {
+                        text: l.text,
+                        confidence: l.confidence as f32,
+                        bbox: l.bbox,
+                        y_center: l.y_center,
+                    })
+                    .collect();
+
+                Ok(RealtimeOcrResult {
+                    changed: true,
+                    lines,
+                    mae: response.mae.unwrap_or(0.0),
+                    elapsed_ms: response.elapsed_ms.unwrap_or(0.0),
+                })
+            }
+            "error" => {
+                let msg = response.message.unwrap_or_else(|| "unknown error".into());
+                Err(OcrError::ProcessingFailed(msg))
+            }
+            other => Err(OcrError::ProcessingFailed(format!(
+                "unexpected response type: {other}"
+            ))),
+        }
+    }
+
+    /// Phase 4: Reset realtime state (clear previous frame in Python worker).
+    pub fn reset_realtime(&self) -> Result<(), OcrError> {
+        let msg = WorkerMessage::ResetRealtime;
+        let response = self.send_recv(&msg)?;
+        match response.msg_type.as_str() {
+            "ack" => Ok(()),
+            "error" => {
+                let msg = response.message.unwrap_or_else(|| "reset failed".into());
+                Err(OcrError::ProcessingFailed(msg))
+            }
+            _ => Ok(()),
         }
     }
 }

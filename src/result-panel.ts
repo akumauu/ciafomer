@@ -77,6 +77,31 @@ btnClose.addEventListener('click', async () => {
   }
 });
 
+// Phase 4: Realtime incremental update — replace content with latest merged result
+listen('realtime-update', (event: { payload: unknown }) => {
+  const data = event.payload as {
+    source: string;
+    translated: string;
+    lines: number;
+    added: number;
+    cached: number;
+    token_saving_pct: number;
+  };
+  sourceText.textContent = data.source;
+  translatedText.textContent = data.translated;
+}).catch((e) => console.error('listen realtime-update failed:', e));
+
+// Phase 4: Realtime stopped — show final stats
+listen('realtime-stopped', (event: { payload: unknown }) => {
+  const data = event.payload as {
+    token_saving_pct: number;
+    lines_translated_via_api: number;
+    lines_from_cache: number;
+  };
+  const stats = `\n\n[Realtime ended: saved ${Math.round(data.token_saving_pct)}% tokens]`;
+  translatedText.textContent = (translatedText.textContent || '') + stats;
+}).catch((e) => console.error('listen realtime-stopped failed:', e));
+
 // Reset on force-cancel
 listen('force-cancel', () => {
   sourceText.textContent = '';

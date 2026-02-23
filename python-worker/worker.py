@@ -1,10 +1,10 @@
 """
-Ciallo OCR Worker — Phase 3.
+Ciallo OCR Worker — Phase 4.
 Standalone Python process communicating via stdin/stdout.
 Protocol: MessagePack framed (4-byte BE length prefix + msgpack payload).
 Model: PaddleOCR + OpenCV, lazy-loaded, idle>=60s auto-unload.
 Features: ROI crop (rect/polygon/perspective), preprocessing (grayscale,
-adaptive threshold, denoise, deskew).
+adaptive threshold, denoise, deskew), realtime pixel diff (MAE).
 """
 
 import sys
@@ -212,6 +212,36 @@ class ImagePreprocessor:
         return rotated
 
 
+class RealtimeState:
+    """Tracks previous ROI image for pixel diff change detection (MAE)."""
+
+    def __init__(self, mae_threshold=5.0):
+        self._previous_roi = None
+        self._mae_threshold = mae_threshold
+
+    def compute_mae(self, img1, img2):
+        """Compute Mean Absolute Error between two images."""
+        np = _ensure_np()
+        if img1.shape != img2.shape:
+            return float("inf")
+        return float(np.mean(np.abs(img1.astype(np.float32) - img2.astype(np.float32))))
+
+    def has_changed(self, current_roi):
+        """Compare current ROI with previous. Returns (changed: bool, mae: float)."""
+        if self._previous_roi is None:
+            self._previous_roi = current_roi.copy()
+            return True, float("inf")
+        mae = self.compute_mae(self._previous_roi, current_roi)
+        changed = mae >= self._mae_threshold
+        if changed:
+            self._previous_roi = current_roi.copy()
+        return changed, mae
+
+    def reset(self):
+        """Clear stored previous frame."""
+        self._previous_roi = None
+
+
 class OcrEngine:
     """Lazy-loading OCR engine with auto-unload on idle."""
 
@@ -275,6 +305,7 @@ class WorkerServer:
     def __init__(self):
         self.engine = OcrEngine()
         self.preprocessor = ImagePreprocessor()
+        self.realtime_state = RealtimeState()
         self._running = True
 
     def handle_message(self, msg):
@@ -327,6 +358,66 @@ class WorkerServer:
                     "request_id": request_id,
                     "message": str(e),
                 }
+
+        elif msg_type == "realtime_ocr":
+            # Phase 4: Realtime incremental OCR with pixel diff.
+            # Compares current ROI with previous using MAE.
+            # Only runs OCR if change detected.
+            image_data = msg.get("image_data", b"")
+            roi_type = msg.get("roi_type", "fullframe")
+            roi_params = msg.get("roi_params", {})
+            preprocess_config = msg.get("preprocess", {})
+
+            try:
+                t0 = time.monotonic()
+
+                # 1. Decode image
+                img = self.preprocessor.decode_image(image_data)
+
+                # 2. Crop ROI
+                roi_img = self.preprocessor.crop_roi(img, roi_type, roi_params)
+
+                # 3. Pixel diff with previous frame (MAE)
+                changed, mae = self.realtime_state.has_changed(roi_img)
+
+                if not changed:
+                    elapsed_ms = (time.monotonic() - t0) * 1000
+                    log.debug(f"Realtime: no change (MAE={mae:.2f}, elapsed={elapsed_ms:.1f}ms)")
+                    return {
+                        "type": "no_change",
+                        "mae": mae,
+                        "elapsed_ms": elapsed_ms,
+                    }
+
+                # 4. Change detected — preprocess + OCR
+                processed = self.preprocessor.preprocess(roi_img, preprocess_config)
+                lines = self.engine.run_ocr(processed)
+
+                elapsed_ms = (time.monotonic() - t0) * 1000
+                log.info(
+                    f"Realtime OCR: {len(lines)} lines, MAE={mae:.2f}, "
+                    f"elapsed={elapsed_ms:.1f}ms"
+                )
+
+                return {
+                    "type": "ocr_result",
+                    "lines": lines,
+                    "mae": mae,
+                    "elapsed_ms": elapsed_ms,
+                }
+
+            except Exception as e:
+                log.exception(f"Realtime OCR error: {e}")
+                return {
+                    "type": "error",
+                    "message": str(e),
+                }
+
+        elif msg_type == "reset_realtime":
+            # Reset realtime state (clear previous frame)
+            self.realtime_state.reset()
+            log.info("Realtime state reset.")
+            return {"type": "ack"}
 
         elif msg_type == "shutdown":
             self._running = False

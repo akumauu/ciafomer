@@ -164,6 +164,44 @@ async function init(): Promise<void> {
     showFeedback('OCR failed: ' + data.error);
   });
 
+  // Phase 4: Realtime incremental translation events
+  await listen('realtime-started', () => {
+    setStatus('Capture');
+    showFeedback('Realtime mode active. Monitoring region...');
+  });
+
+  await listen('realtime-update', (event: { payload: unknown }) => {
+    const data = event.payload as {
+      lines: number;
+      added: number;
+      cached: number;
+      token_saving_pct: number;
+    };
+    setStatus('Render');
+    showFeedback(
+      `Realtime: ${data.lines} lines (${data.added} new, ${data.cached} cached, saved ${Math.round(data.token_saving_pct)}%)`,
+      3000
+    );
+  });
+
+  await listen('realtime-error', (event: { payload: unknown }) => {
+    const data = event.payload as { error: string };
+    showFeedback('Realtime error: ' + data.error);
+  });
+
+  await listen('realtime-stopped', (event: { payload: unknown }) => {
+    const data = event.payload as {
+      token_saving_pct: number;
+      lines_translated_via_api: number;
+      lines_from_cache: number;
+    };
+    setStatus('Sleep');
+    showFeedback(
+      `Realtime stopped. Token saving: ${Math.round(data.token_saving_pct)}% (${data.lines_from_cache} cached / ${data.lines_translated_via_api} API)`,
+      5000
+    );
+  });
+
   // Initial state
   const state = await invoke('get_state') as string;
   setStatus(state as AppState);
